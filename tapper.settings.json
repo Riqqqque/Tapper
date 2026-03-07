@@ -6,6 +6,8 @@
   "forwardTapPulseGapMs": 0,
   "heldForwardRetapReleaseMs": 2,
   "maxQueuedForwardTaps": 24,
+  "triggerOnWheelDown": true,
+  "triggerOnWheelUp": true,
   "requireStrafeKey": true,
   "blockWhenForwardHeld": false,
   "processNames": [

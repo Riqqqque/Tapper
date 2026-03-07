@@ -173,13 +173,29 @@ internal static class Program
         if (nCode >= 0 && unchecked((uint)wParam.ToInt64()) == WmMouseWheel)
         {
             var data = Marshal.PtrToStructure<MsLlHookStruct>(lParam);
-            if (GetWheelDelta(data.mouseData) < 0 && ShouldSendForwardTap())
+            var wheelDelta = GetWheelDelta(data.mouseData);
+            if (ShouldTriggerForWheelDelta(wheelDelta) && ShouldSendForwardTap())
             {
                 QueueForwardTapBurst();
             }
         }
 
         return NativeMethods.CallNextHookEx(mouseHook, nCode, wParam, lParam);
+    }
+
+    private static bool ShouldTriggerForWheelDelta(short wheelDelta)
+    {
+        if (wheelDelta == 0)
+        {
+            return false;
+        }
+
+        if (wheelDelta < 0)
+        {
+            return settings.TriggerOnWheelDown;
+        }
+
+        return settings.TriggerOnWheelUp;
     }
 
     private static bool ShouldSendForwardTap()
@@ -564,8 +580,29 @@ internal static class Program
             Console.WriteLine($"Target process names: {string.Join(", ", settings.ProcessNames)}");
             Console.WriteLine($"Target title matches: {string.Join(", ", settings.WindowTitleContains)}");
             Console.WriteLine($"Forward pulses per wheel notch: {settings.ForwardTapBurstCount}");
+            Console.WriteLine($"Trigger directions: {BuildTriggerDirectionLabel()}");
             Console.WriteLine();
         }
+    }
+
+    private static string BuildTriggerDirectionLabel()
+    {
+        if (settings.TriggerOnWheelDown && settings.TriggerOnWheelUp)
+        {
+            return "wheel down + wheel up";
+        }
+
+        if (settings.TriggerOnWheelDown)
+        {
+            return "wheel down";
+        }
+
+        if (settings.TriggerOnWheelUp)
+        {
+            return "wheel up";
+        }
+
+        return "disabled";
     }
 
     private static void WriteStatus(string message)
@@ -585,6 +622,8 @@ internal static class Program
         public int ForwardTapPulseGapMs { get; set; } = 0;
         public int HeldForwardRetapReleaseMs { get; set; } = 2;
         public int MaxQueuedForwardTaps { get; set; } = 24;
+        public bool TriggerOnWheelDown { get; set; } = true;
+        public bool TriggerOnWheelUp { get; set; } = true;
         public bool RequireStrafeKey { get; set; } = true;
         public bool BlockWhenForwardHeld { get; set; } = false;
         public string[] ProcessNames { get; set; } = ["r5apex.exe"];
@@ -619,6 +658,11 @@ internal static class Program
             ForwardTapPulseGapMs = Math.Clamp(ForwardTapPulseGapMs, 0, 10);
             HeldForwardRetapReleaseMs = Math.Clamp(HeldForwardRetapReleaseMs, 1, 10);
             MaxQueuedForwardTaps = Math.Clamp(MaxQueuedForwardTaps, 1, 64);
+            if (!TriggerOnWheelDown && !TriggerOnWheelUp)
+            {
+                TriggerOnWheelDown = true;
+            }
+
             ProcessNames = NormalizeEntries(ProcessNames, ["r5apex.exe"]);
             WindowTitleContains = NormalizeEntries(WindowTitleContains, ["Apex Legends"]);
         }
