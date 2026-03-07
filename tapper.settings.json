@@ -1,0 +1,17 @@
+{
+  "enabledOnStart": true,
+  "forwardTapHoldMs": 6,
+  "forwardTapCooldownMs": 0,
+  "forwardTapBurstCount": 3,
+  "forwardTapPulseGapMs": 0,
+  "heldForwardRetapReleaseMs": 2,
+  "maxQueuedForwardTaps": 24,
+  "requireStrafeKey": true,
+  "blockWhenForwardHeld": false,
+  "processNames": [
+    "r5apex.exe"
+  ],
+  "windowTitleContains": [
+    "Apex Legends"
+  ]
+}
