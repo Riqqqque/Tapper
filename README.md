@@ -1,5 +1,7 @@
 # Tapper
 
+![Tapper logo](assets/logo.png)
+
 Small Windows helper for Apex tap-strafing with `Mouse Wheel`.
 
 ## What it does
@@ -17,8 +19,14 @@ Small Windows helper for Apex tap-strafing with `Mouse Wheel`.
 ## Use
 
 1. Bind jump to the wheel directions you actually use in Apex.
-2. Run the built `Tapper.exe`.
+2. Install Tapper with `TapperSetup-<version>.exe`, or run the built `Tapper.exe` directly if you are testing locally.
 3. When you want the assist, leave it enabled and use `A` or `D` with your mouse turn as usual.
+
+## Installer
+
+- Run `scripts\build-installer.ps1` to publish a self-contained app and compile the setup exe.
+- The shareable installer is written to `installer-dist\TapperSetup-<version>.exe`.
+- The installer defaults to `%LocalAppData%\Tapper`, creates a Start Menu shortcut, and can optionally add a desktop shortcut or startup shortcut.
 
 ## Config
 
