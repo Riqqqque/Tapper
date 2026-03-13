@@ -81,6 +81,11 @@ internal static class Program
             return 1;
         }
 
+        if (TryHandOffToInstalledCopy())
+        {
+            return 0;
+        }
+
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
@@ -216,6 +221,250 @@ internal static class Program
     private static string BuildTrayText()
     {
         return enabled ? "Tapper - enabled" : "Tapper - disabled";
+    }
+
+    private static bool TryHandOffToInstalledCopy()
+    {
+        var currentExecutablePath = GetCurrentExecutablePath();
+        var installedExecutablePath = GetInstalledExecutablePath();
+        var installedDirectoryPath = Path.GetDirectoryName(installedExecutablePath);
+
+        if (string.IsNullOrWhiteSpace(currentExecutablePath) ||
+            string.IsNullOrWhiteSpace(installedDirectoryPath) ||
+            PathsEqual(currentExecutablePath, installedExecutablePath) ||
+            !Directory.Exists(installedDirectoryPath))
+        {
+            return false;
+        }
+
+        var currentVersion = GetExecutableVersion(currentExecutablePath);
+        var installedVersion = GetExecutableVersion(installedExecutablePath);
+        var installedCopyRunning = IsProcessRunningFromPath(installedExecutablePath);
+
+        if (File.Exists(installedExecutablePath) && currentVersion <= installedVersion)
+        {
+            if (installedCopyRunning)
+            {
+                return true;
+            }
+
+            return TryStartProcess(installedExecutablePath);
+        }
+
+        return TryStartInstalledCopyUpdate(currentExecutablePath, installedExecutablePath);
+    }
+
+    private static string GetCurrentExecutablePath()
+    {
+        return Path.GetFullPath(Environment.ProcessPath ?? Application.ExecutablePath);
+    }
+
+    private static string GetInstalledExecutablePath()
+    {
+        var localAppDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return Path.Combine(localAppDataPath, "Tapper", "Tapper.exe");
+    }
+
+    private static Version GetExecutableVersion(string executablePath)
+    {
+        try
+        {
+            var versionText = FileVersionInfo.GetVersionInfo(executablePath).FileVersion;
+            return Version.TryParse(versionText, out var parsedVersion)
+                ? parsedVersion
+                : new Version(0, 0, 0, 0);
+        }
+        catch
+        {
+            return new Version(0, 0, 0, 0);
+        }
+    }
+
+    private static bool IsProcessRunningFromPath(string executablePath)
+    {
+        var currentProcessId = Environment.ProcessId;
+        var targetProcessName = Path.GetFileNameWithoutExtension(executablePath);
+
+        foreach (var process in Process.GetProcessesByName(targetProcessName))
+        {
+            try
+            {
+                if (process.Id == currentProcessId)
+                {
+                    continue;
+                }
+
+                if (PathsEqual(process.MainModule?.FileName, executablePath))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryStartInstalledCopyUpdate(string sourceExecutablePath, string targetExecutablePath)
+    {
+        try
+        {
+            var sourceDirectoryPath = Path.GetDirectoryName(sourceExecutablePath);
+            var targetDirectoryPath = Path.GetDirectoryName(targetExecutablePath);
+            if (string.IsNullOrWhiteSpace(sourceDirectoryPath) || string.IsNullOrWhiteSpace(targetDirectoryPath))
+            {
+                return false;
+            }
+
+            var scriptPath = Path.Combine(
+                Path.GetTempPath(),
+                $"TapperSelfUpdate-{Guid.NewGuid():N}.ps1");
+
+            File.WriteAllText(
+                scriptPath,
+                BuildInstalledCopyUpdateScript(sourceDirectoryPath, targetDirectoryPath, targetExecutablePath, Environment.ProcessId),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            var powershellPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                @"WindowsPowerShell\v1.0\powershell.exe");
+
+            if (!File.Exists(powershellPath))
+            {
+                powershellPath = "powershell.exe";
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = powershellPath,
+                Arguments = $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{scriptPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = sourceDirectoryPath
+            };
+
+            Process.Start(startInfo)?.Dispose();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string BuildInstalledCopyUpdateScript(
+        string sourceDirectoryPath,
+        string targetDirectoryPath,
+        string targetExecutablePath,
+        int currentProcessId)
+    {
+        return $$"""
+$ErrorActionPreference = 'Stop'
+$sourceDirectoryPath = '{{EscapePowerShellLiteral(sourceDirectoryPath)}}'
+$targetDirectoryPath = '{{EscapePowerShellLiteral(targetDirectoryPath)}}'
+$targetExecutablePath = '{{EscapePowerShellLiteral(targetExecutablePath)}}'
+$currentProcessId = {{currentProcessId}}
+
+function Test-SamePath {
+    param(
+        [string]$leftPath,
+        [string]$rightPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($leftPath) -or [string]::IsNullOrWhiteSpace($rightPath)) {
+        return $false
+    }
+
+    return [string]::Equals(
+        [System.IO.Path]::GetFullPath($leftPath),
+        [System.IO.Path]::GetFullPath($rightPath),
+        [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+$targetProcessName = [System.IO.Path]::GetFileNameWithoutExtension($targetExecutablePath)
+$targetProcesses = @(Get-Process -Name $targetProcessName -ErrorAction SilentlyContinue | Where-Object {
+    try {
+        $_.Id -ne $currentProcessId -and (Test-SamePath $_.Path $targetExecutablePath)
+    }
+    catch {
+        $false
+    }
+})
+
+foreach ($targetProcess in $targetProcesses) {
+    Stop-Process -Id $targetProcess.Id -Force -ErrorAction SilentlyContinue
+}
+
+if ($targetProcesses.Count -gt 0) {
+    Start-Sleep -Milliseconds 400
+}
+
+New-Item -ItemType Directory -Path $targetDirectoryPath -Force | Out-Null
+
+Get-ChildItem -LiteralPath $sourceDirectoryPath -Force | ForEach-Object {
+    $destinationPath = Join-Path $targetDirectoryPath $_.Name
+
+    if ([string]::Equals($_.Name, 'tapper.settings.json', [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $destinationPath)) {
+        return
+    }
+
+    Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
+}
+
+Start-Process -FilePath $targetExecutablePath | Out-Null
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+""";
+    }
+
+    private static string EscapePowerShellLiteral(string value)
+    {
+        return value.Replace("'", "''", StringComparison.Ordinal);
+    }
+
+    private static bool TryStartProcess(string executablePath)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = executablePath,
+                UseShellExecute = true,
+                WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory
+            })?.Dispose();
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool PathsEqual(string? leftPath, string? rightPath)
+    {
+        if (string.IsNullOrWhiteSpace(leftPath) || string.IsNullOrWhiteSpace(rightPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(leftPath),
+                Path.GetFullPath(rightPath),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -360,15 +609,19 @@ internal static class Program
 
     private static void QueueForwardTapBurst()
     {
+        var queueSingleHeldForwardTap = !settings.BlockWhenForwardHeld && wDown;
+        var tapCount = queueSingleHeldForwardTap ? 1 : settings.ForwardTapBurstCount;
+        var maxQueuedTaps = queueSingleHeldForwardTap ? 1 : settings.MaxQueuedForwardTaps;
+
         while (true)
         {
             var current = Volatile.Read(ref queuedForwardTaps);
-            if (current >= settings.MaxQueuedForwardTaps)
+            if (current >= maxQueuedTaps)
             {
                 return;
             }
 
-            var target = Math.Min(settings.MaxQueuedForwardTaps, current + settings.ForwardTapBurstCount);
+            var target = Math.Min(maxQueuedTaps, current + tapCount);
             if (Interlocked.CompareExchange(ref queuedForwardTaps, target, current) == current)
             {
                 ForwardTapQueued.Set();
