@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Windows.Forms;
 
 internal static class Program
 {
@@ -35,16 +37,26 @@ internal static class Program
     };
 
     private static readonly object CleanupSync = new();
-    private static readonly object ConsoleSync = new();
     private static readonly object ForwardKeySync = new();
+    private static readonly object SendInputSync = new();
+    private static readonly object TargetWindowSync = new();
     private static readonly int InputSize = Marshal.SizeOf<Input>();
     private static readonly AutoResetEvent ForwardTapQueued = new(initialState: false);
+    private static readonly Input[] SendInputBuffer = new Input[1];
 
     private static HookProc? keyboardHookProc;
     private static HookProc? mouseHookProc;
     private static Thread? forwardTapWorkerThread;
+    private static HotkeyWindow? hotkeyWindow;
+    private static NotifyIcon? trayIcon;
+    private static ContextMenuStrip? trayMenu;
+    private static ToolStripMenuItem? assistStateMenuItem;
+    private static ToolStripMenuItem? toggleAssistMenuItem;
+    private static Icon? appIcon;
     private static IntPtr keyboardHook;
     private static IntPtr mouseHook;
+    private static IntPtr cachedTargetWindowHandle;
+    private static bool cachedTargetWindowMatch;
     private static TapperSettings settings = TapperSettings.Load(JsonOptions);
     private static volatile bool enabled = settings.EnabledOnStart;
     private static volatile bool aDown;
@@ -61,27 +73,45 @@ internal static class Program
     {
         if (!OperatingSystem.IsWindows())
         {
-            Console.Error.WriteLine("This helper only runs on Windows.");
+            MessageBox.Show(
+                "Tapper only runs on Windows.",
+                "Tapper",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
             return 1;
         }
 
-        Console.Title = "Tapper";
-        Console.CancelKeyPress += OnCancelKeyPress;
+        Application.SetHighDpiMode(HighDpiMode.SystemAware);
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Cleanup();
-
-        keyboardHookProc = KeyboardHookCallback;
-        mouseHookProc = MouseHookCallback;
-
-        keyboardHook = InstallHook(WhKeyboardLl, keyboardHookProc);
-        mouseHook = InstallHook(WhMouseLl, mouseHookProc);
-        RegisterHotkeys();
-        StartForwardTapWorker();
-        WriteBanner();
 
         try
         {
-            RunMessageLoop();
+            keyboardHookProc = KeyboardHookCallback;
+            mouseHookProc = MouseHookCallback;
+
+            InitializeTrayIcon();
+            InitializeHotkeyWindow();
+
+            keyboardHook = InstallHook(WhKeyboardLl, keyboardHookProc);
+            mouseHook = InstallHook(WhMouseLl, mouseHookProc);
+            RegisterHotkeys();
+            StartForwardTapWorker();
+            UpdateTrayState();
+
+            Application.Run();
             return 0;
+        }
+        catch (Exception ex)
+        {
+            Cleanup();
+            MessageBox.Show(
+                ex.Message,
+                "Tapper",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return 1;
         }
         finally
         {
@@ -89,24 +119,67 @@ internal static class Program
         }
     }
 
-    private static void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs args)
+    private static void InitializeTrayIcon()
     {
-        args.Cancel = true;
-        NativeMethods.PostQuitMessage(0);
+        appIcon = LoadApplicationIcon();
+
+        assistStateMenuItem = new ToolStripMenuItem
+        {
+            Enabled = false
+        };
+
+        toggleAssistMenuItem = new ToolStripMenuItem();
+        toggleAssistMenuItem.Click += (_, _) => ToggleAssist();
+
+        var exitMenuItem = new ToolStripMenuItem("Exit (Ctrl+F8)");
+        exitMenuItem.Click += (_, _) => ExitApplication();
+
+        trayMenu = new ContextMenuStrip();
+        trayMenu.Items.Add(assistStateMenuItem);
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add(toggleAssistMenuItem);
+        trayMenu.Items.Add(exitMenuItem);
+
+        trayIcon = new NotifyIcon
+        {
+            Icon = appIcon,
+            ContextMenuStrip = trayMenu,
+            Text = BuildTrayText(),
+            Visible = true
+        };
     }
 
-    private static void RunMessageLoop()
+    private static void InitializeHotkeyWindow()
     {
-        while (NativeMethods.GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
-        {
-            if (msg.message == WmHotkey)
-            {
-                HandleHotkey((int)msg.wParam);
-            }
+        hotkeyWindow = new HotkeyWindow();
+        hotkeyWindow.HotkeyPressed += HandleHotkey;
+    }
 
-            NativeMethods.TranslateMessage(ref msg);
-            NativeMethods.DispatchMessage(ref msg);
+    private static Icon LoadApplicationIcon()
+    {
+        var extracted = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        return extracted is not null
+            ? extracted
+            : (Icon)SystemIcons.Application.Clone();
+    }
+
+    private static void ToggleAssist()
+    {
+        enabled = !enabled;
+        if (!enabled)
+        {
+            Interlocked.Exchange(ref queuedForwardTaps, 0);
+            ReleaseSyntheticForwardHoldIfNeeded();
         }
+
+        WriteStatus(enabled ? "assist enabled" : "assist disabled");
+        UpdateTrayState();
+    }
+
+    private static void ExitApplication()
+    {
+        WriteStatus("shutting down");
+        Application.ExitThread();
     }
 
     private static void HandleHotkey(int hotkeyId)
@@ -114,20 +187,35 @@ internal static class Program
         switch (hotkeyId)
         {
             case ToggleHotkeyId:
-                enabled = !enabled;
-                if (!enabled)
-                {
-                    Interlocked.Exchange(ref queuedForwardTaps, 0);
-                    ReleaseSyntheticForwardHoldIfNeeded();
-                }
-
-                WriteStatus(enabled ? "assist enabled" : "assist disabled");
+                ToggleAssist();
                 break;
             case ExitHotkeyId:
-                WriteStatus("shutting down");
-                NativeMethods.PostQuitMessage(0);
+                ExitApplication();
                 break;
         }
+    }
+
+    private static void UpdateTrayState()
+    {
+        if (assistStateMenuItem is not null)
+        {
+            assistStateMenuItem.Text = enabled ? "Assist: enabled" : "Assist: disabled";
+        }
+
+        if (toggleAssistMenuItem is not null)
+        {
+            toggleAssistMenuItem.Text = enabled ? "Disable Assist (F8)" : "Enable Assist (F8)";
+        }
+
+        if (trayIcon is not null)
+        {
+            trayIcon.Text = BuildTrayText();
+        }
+    }
+
+    private static string BuildTrayText()
+    {
+        return enabled ? "Tapper - enabled" : "Tapper - disabled";
     }
 
     private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -254,6 +342,11 @@ internal static class Program
 
             while (TryTakeQueuedForwardTap())
             {
+                if (shuttingDown)
+                {
+                    return;
+                }
+
                 if (!CanProcessQueuedForwardTap())
                 {
                     continue;
@@ -329,6 +422,27 @@ internal static class Program
             return false;
         }
 
+        lock (TargetWindowSync)
+        {
+            if (windowHandle == cachedTargetWindowHandle)
+            {
+                return cachedTargetWindowMatch;
+            }
+        }
+
+        var matchesTarget = MatchesTargetWindow(windowHandle);
+
+        lock (TargetWindowSync)
+        {
+            cachedTargetWindowHandle = windowHandle;
+            cachedTargetWindowMatch = matchesTarget;
+        }
+
+        return matchesTarget;
+    }
+
+    private static bool MatchesTargetWindow(IntPtr windowHandle)
+    {
         var processName = TryGetForegroundProcessName(windowHandle);
         if (MatchesConfiguredProcess(processName))
         {
@@ -465,7 +579,13 @@ internal static class Program
             }
         };
 
-        var sent = NativeMethods.SendInput(1, new[] { input }, InputSize);
+        uint sent;
+        lock (SendInputSync)
+        {
+            SendInputBuffer[0] = input;
+            sent = NativeMethods.SendInput(1, SendInputBuffer, InputSize);
+        }
+
         if (sent != 1)
         {
             WriteStatus($"SendInput failed with {Marshal.GetLastWin32Error()}");
@@ -525,12 +645,17 @@ internal static class Program
 
     private static void RegisterHotkeys()
     {
-        if (!NativeMethods.RegisterHotKey(IntPtr.Zero, ToggleHotkeyId, ModNoRepeat, VkF8))
+        if (hotkeyWindow is null)
+        {
+            throw new InvalidOperationException("Hotkey window was not initialized.");
+        }
+
+        if (!NativeMethods.RegisterHotKey(hotkeyWindow.Handle, ToggleHotkeyId, ModNoRepeat, VkF8))
         {
             throw new InvalidOperationException($"Unable to register F8 toggle hotkey. Win32 error: {Marshal.GetLastWin32Error()}");
         }
 
-        if (!NativeMethods.RegisterHotKey(IntPtr.Zero, ExitHotkeyId, ModControl | ModNoRepeat, VkF8))
+        if (!NativeMethods.RegisterHotKey(hotkeyWindow.Handle, ExitHotkeyId, ModControl | ModNoRepeat, VkF8))
         {
             throw new InvalidOperationException($"Unable to register Ctrl+F8 exit hotkey. Win32 error: {Marshal.GetLastWin32Error()}");
         }
@@ -549,12 +674,16 @@ internal static class Program
             shuttingDown = true;
         }
 
+        Interlocked.Exchange(ref queuedForwardTaps, 0);
         ForwardTapQueued.Set();
         forwardTapWorkerThread?.Join(millisecondsTimeout: 250);
         ReleaseSyntheticForwardHoldIfNeeded();
 
-        NativeMethods.UnregisterHotKey(IntPtr.Zero, ToggleHotkeyId);
-        NativeMethods.UnregisterHotKey(IntPtr.Zero, ExitHotkeyId);
+        if (hotkeyWindow is not null)
+        {
+            NativeMethods.UnregisterHotKey(hotkeyWindow.Handle, ToggleHotkeyId);
+            NativeMethods.UnregisterHotKey(hotkeyWindow.Handle, ExitHotkeyId);
+        }
 
         if (keyboardHook != IntPtr.Zero)
         {
@@ -567,50 +696,26 @@ internal static class Program
             _ = NativeMethods.UnhookWindowsHookEx(mouseHook);
             mouseHook = IntPtr.Zero;
         }
-    }
 
-    private static void WriteBanner()
-    {
-        lock (ConsoleSync)
+        if (trayIcon is not null)
         {
-            Console.WriteLine("Tapper is running.");
-            Console.WriteLine("F8 toggles the assist on or off.");
-            Console.WriteLine("Ctrl+F8 exits the app.");
-            Console.WriteLine($"Current state: {(enabled ? "enabled" : "disabled")}.");
-            Console.WriteLine($"Target process names: {string.Join(", ", settings.ProcessNames)}");
-            Console.WriteLine($"Target title matches: {string.Join(", ", settings.WindowTitleContains)}");
-            Console.WriteLine($"Forward pulses per wheel notch: {settings.ForwardTapBurstCount}");
-            Console.WriteLine($"Trigger directions: {BuildTriggerDirectionLabel()}");
-            Console.WriteLine();
-        }
-    }
-
-    private static string BuildTriggerDirectionLabel()
-    {
-        if (settings.TriggerOnWheelDown && settings.TriggerOnWheelUp)
-        {
-            return "wheel down + wheel up";
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            trayIcon = null;
         }
 
-        if (settings.TriggerOnWheelDown)
-        {
-            return "wheel down";
-        }
-
-        if (settings.TriggerOnWheelUp)
-        {
-            return "wheel up";
-        }
-
-        return "disabled";
+        trayMenu?.Dispose();
+        trayMenu = null;
+        hotkeyWindow?.Dispose();
+        hotkeyWindow = null;
+        appIcon?.Dispose();
+        appIcon = null;
+        ForwardTapQueued.Dispose();
     }
 
     private static void WriteStatus(string message)
     {
-        lock (ConsoleSync)
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
-        }
+        Debug.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
     }
 
     private sealed class TapperSettings
@@ -643,9 +748,8 @@ internal static class Program
                 loaded.Normalize();
                 return loaded;
             }
-            catch (Exception ex)
+            catch
             {
-                Console.Error.WriteLine($"Failed to load settings from '{path}': {ex.Message}. Using defaults.");
                 return new TapperSettings();
             }
         }
@@ -681,23 +785,36 @@ internal static class Program
 
     private delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
 
+    private sealed class HotkeyWindow : NativeWindow, IDisposable
+    {
+        public event Action<int>? HotkeyPressed;
+
+        public HotkeyWindow()
+        {
+            CreateHandle(new CreateParams());
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WmHotkey)
+            {
+                HotkeyPressed?.Invoke(m.WParam.ToInt32());
+            }
+
+            base.WndProc(ref m);
+        }
+
+        public void Dispose()
+        {
+            DestroyHandle();
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct Point
     {
         public int x;
         public int y;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Msg
-    {
-        public IntPtr hwnd;
-        public uint message;
-        public UIntPtr wParam;
-        public IntPtr lParam;
-        public uint time;
-        public Point pt;
-        public uint lPrivate;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -783,19 +900,6 @@ internal static class Program
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr GetModuleHandle(string? lpModuleName);
-
-        [DllImport("user32.dll")]
-        public static extern int GetMessage(out Msg lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
-
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool TranslateMessage([In] ref Msg lpMsg);
-
-        [DllImport("user32.dll")]
-        public static extern IntPtr DispatchMessage([In] ref Msg lpMsg);
-
-        [DllImport("user32.dll")]
-        public static extern void PostQuitMessage(int nExitCode);
 
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

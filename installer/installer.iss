@@ -46,10 +46,10 @@ Source: "{#PublishDir}\tapper.settings.json"; DestDir: "{app}"; Flags: onlyifdoe
 Source: "{#PublishDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Tapper"; Filename: "{app}\Tapper.exe"
+Name: "{group}\Tapper"; Filename: "{app}\Tapper.exe"; IconFilename: "{app}\Tapper.exe"
 Name: "{group}\Uninstall Tapper"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Tapper"; Filename: "{app}\Tapper.exe"; Tasks: desktopicon
-Name: "{userstartup}\Tapper"; Filename: "{app}\Tapper.exe"; Tasks: startupicon
+Name: "{autodesktop}\Tapper"; Filename: "{app}\Tapper.exe"; IconFilename: "{app}\Tapper.exe"; Tasks: desktopicon
+Name: "{userstartup}\Tapper"; Filename: "{app}\Tapper.exe"; IconFilename: "{app}\Tapper.exe"; Tasks: startupicon
 
 [Run]
 Filename: "{app}\Tapper.exe"; Description: "Launch Tapper"; Flags: nowait postinstall skipifsilent
