@@ -4,6 +4,8 @@
 
 Small Windows helper for Apex tap-strafing with `Mouse Wheel`.
 
+The app is now built as a native Rust executable and does not need the .NET runtime on the target machine.
+
 ## What it does
 
 - Leaves your wheel input alone so Apex still sees your normal scroll-wheel input.
@@ -25,7 +27,7 @@ Small Windows helper for Apex tap-strafing with `Mouse Wheel`.
 
 ## Installer
 
-- Run `scripts\build-installer.ps1` to publish a self-contained app and compile the setup exe.
+- Run `scripts\build-installer.ps1` to build the Rust release, refresh `dist`, and compile the setup exe.
 - The shareable installer is written to `installer-dist\TapperSetup-<version>.exe`.
 - The installer defaults to `%LocalAppData%\Tapper`, creates a Start Menu shortcut, and can optionally add a desktop shortcut or startup shortcut.
 

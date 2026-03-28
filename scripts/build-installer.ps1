@@ -1,25 +1,40 @@
 param(
-    [string]$Configuration = "Release",
-    [string]$Runtime = "win-x64"
+    [ValidateSet("debug", "release")]
+    [string]$Configuration = "release",
+    [string]$Target = "x86_64-pc-windows-msvc"
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$projectPath = Join-Path $repoRoot "Tapper.csproj"
+$manifestPath = Join-Path $repoRoot "Cargo.toml"
 $readmePath = Join-Path $repoRoot "README.md"
+$settingsPath = Join-Path $repoRoot "tapper.settings.json"
 $installerScriptPath = Join-Path $repoRoot "installer\\installer.iss"
 $publishDir = Join-Path $repoRoot "installer-build\\publish"
+$distDir = Join-Path $repoRoot "dist"
 $outputDir = Join-Path $repoRoot "installer-dist"
 
-if (-not (Test-Path $projectPath)) {
-    throw "Project file not found at $projectPath."
+if (-not (Test-Path $manifestPath)) {
+    throw "Cargo.toml was not found at $manifestPath."
 }
 
-[xml]$projectXml = Get-Content $projectPath
-$version = $projectXml.Project.PropertyGroup.Version | Select-Object -First 1
-if ([string]::IsNullOrWhiteSpace($version)) {
-    throw "Version is missing from Tapper.csproj."
+$manifest = Get-Content $manifestPath -Raw
+$versionMatch = [regex]::Match($manifest, '(?m)^\s*version\s*=\s*"([^"]+)"')
+if (-not $versionMatch.Success) {
+    throw "Version is missing from Cargo.toml."
+}
+
+$version = $versionMatch.Groups[1].Value
+
+$cargoCandidates = @(
+    (Get-Command cargo.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+    (Join-Path $env:USERPROFILE ".cargo\\bin\\cargo.exe")
+) | Where-Object { $_ -and (Test-Path $_) }
+
+$cargoPath = $cargoCandidates | Select-Object -First 1
+if (-not $cargoPath) {
+    throw "cargo.exe was not found. Install Rust first."
 }
 
 $isccCandidates = @(
@@ -38,22 +53,35 @@ if (Test-Path $publishDir) {
     Remove-Item $publishDir -Recurse -Force
 }
 
+if (Test-Path $distDir) {
+    Remove-Item $distDir -Recurse -Force
+}
+
+if (Test-Path $outputDir) {
+    Remove-Item $outputDir -Recurse -Force
+}
+
 New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
+New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
-dotnet publish $projectPath `
-    -c $Configuration `
-    -r $Runtime `
-    --source https://api.nuget.org/v3/index.json `
-    --self-contained true `
-    -o $publishDir `
-    -p:PublishSingleFile=true `
-    -p:PublishTrimmed=false `
-    -p:DebugType=None `
-    -p:DebugSymbols=false `
-    -p:IncludeNativeLibrariesForSelfExtract=true
+& $cargoPath build `
+    --manifest-path $manifestPath `
+    --target $Target `
+    $(if ($Configuration -eq "release") { "--release" }) `
+    --locked
 
-Copy-Item $readmePath (Join-Path $publishDir "README.md") -Force
+$binaryDir = Join-Path $repoRoot "target\\$Target\\$Configuration"
+$binaryPath = Join-Path $binaryDir "Tapper.exe"
+if (-not (Test-Path $binaryPath)) {
+    throw "Build finished without creating $binaryPath."
+}
+
+foreach ($destination in @($publishDir, $distDir)) {
+    Copy-Item $binaryPath (Join-Path $destination "Tapper.exe") -Force
+    Copy-Item $settingsPath (Join-Path $destination "tapper.settings.json") -Force
+    Copy-Item $readmePath (Join-Path $destination "README.md") -Force
+}
 
 & $isccPath `
     /Qp `
@@ -71,3 +99,4 @@ if (-not $installer) {
 }
 
 Write-Host "Installer created at $($installer.FullName)"
+Write-Host "Dist folder refreshed at $distDir"
