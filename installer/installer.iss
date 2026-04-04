@@ -45,7 +45,7 @@ Name: "startupicon"; Description: "Run Tapper when I sign in"; GroupDescription:
 
 [Files]
 Source: "{#PublishDir}\Tapper.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PublishDir}\tapper.settings.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
+Source: "{#PublishDir}\tapper.settings.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PublishDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -149,22 +149,101 @@ begin
   end;
 end;
 
+function EscapePowerShellLiteral(const Value: String): String;
+begin
+  Result := Value;
+  StringChangeEx(Result, '''', '''''', True);
+end;
+
 procedure StopRunningTapper;
 var
+  AppPath: String;
+  PowerShellPath: String;
+  Parameters: String;
   ResultCode: Integer;
 begin
+  AppPath := ExpandConstant('{app}\Tapper.exe');
+  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters :=
+    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' +
+    '"$targetPath = ''' + EscapePowerShellLiteral(AppPath) + '''; ' +
+    '$targetProcesses = @(Get-Process -Name ''Tapper'' -ErrorAction SilentlyContinue | Where-Object { ' +
+    'try { [string]::Equals([System.IO.Path]::GetFullPath($_.Path), [System.IO.Path]::GetFullPath($targetPath), [System.StringComparison]::OrdinalIgnoreCase) } catch { $false } ' +
+    '}); ' +
+    '$targetProcesses | Stop-Process -Force -ErrorAction SilentlyContinue; ' +
+    '$targetProcesses | ForEach-Object { Wait-Process -Id $_.Id -Timeout 5 -ErrorAction SilentlyContinue }"';
   Exec(
-    ExpandConstant('{sys}\taskkill.exe'),
-    '/F /T /IM Tapper.exe',
+    PowerShellPath,
+    Parameters,
     '',
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode);
 end;
 
+function IsPreservedInstallerFile(const Name: String): Boolean;
+var
+  UpperName: String;
+begin
+  UpperName := Uppercase(Name);
+  Result := Copy(UpperName, 1, 5) = 'UNINS';
+end;
+
+procedure ClearExistingTapperAppFiles;
+var
+  AppDir: String;
+  EntryPath: String;
+  FindRec: TFindRec;
+begin
+  AppDir := ExpandConstant('{app}');
+
+  if not DirExists(AppDir) then
+  begin
+    exit;
+  end;
+
+  if not FileExists(AppDir + '\Tapper.exe') then
+  begin
+    exit;
+  end;
+
+  if not FindFirst(AppDir + '\*', FindRec) then
+  begin
+    exit;
+  end;
+
+  try
+    repeat
+      if (FindRec.Name <> '.') and (FindRec.Name <> '..') and
+         not IsPreservedInstallerFile(FindRec.Name) then
+      begin
+        EntryPath := AppDir + '\' + FindRec.Name;
+        if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
+        begin
+          DelTree(EntryPath, True, True, True);
+        end
+        else
+        begin
+          DeleteFile(EntryPath);
+        end;
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 begin
-  StopRunningTapper;
   ClearTapperPendingRenameOperations;
   Result := True;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+  begin
+    StopRunningTapper;
+    ClearExistingTapperAppFiles;
+  end;
 end;

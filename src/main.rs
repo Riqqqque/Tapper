@@ -1,10 +1,11 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString, c_void};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
@@ -14,24 +15,32 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::thread_local;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT,
-    WAIT_OBJECT_0, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    LRESULT, POINT, WAIT_OBJECT_0, WPARAM,
 };
+use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW, SetEvent, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateMutexW, CreateWaitableTimerExW,
+    GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW, SetEvent, SetWaitableTimerEx, TIMER_ALL_ACCESS,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MAPVK_VK_TO_VSC, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey,
+};
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
+    RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::Shell::{
     ExtractIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -41,13 +50,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HHOOK, HICON, IDC_ARROW,
-    IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK,
-    MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowsHookExW,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_MOUSEWHEEL,
-    WM_NULL, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_OVERLAPPED,
+    IDI_APPLICATION, KBDLLHOOKSTRUCT, KillTimer, LLKHF_INJECTED, LoadCursorW, LoadIconW,
+    MB_ICONERROR, MB_OK, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RI_MOUSE_WHEEL, RegisterClassW, SetForegroundWindow, SetTimer,
+    SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
@@ -55,18 +64,55 @@ const TOGGLE_HOTKEY_ID: i32 = 1;
 const EXIT_HOTKEY_ID: i32 = 2;
 const MENU_TOGGLE_ID: u32 = 1001;
 const MENU_EXIT_ID: u32 = 1002;
+const MENU_OPEN_FOLDER_ID: u32 = 1003;
+const MENU_OPEN_LOG_ID: u32 = 1004;
+const MENU_OPEN_SETTINGS_ID: u32 = 1005;
 const TRAY_ICON_ID: u32 = 1;
+const TARGET_WINDOW_TIMER_ID: usize = 1;
+const TARGET_WINDOW_TIMER_INTERVAL_MS: u32 = 16;
 const MOD_CONTROL: u32 = 0x0002;
 const MOD_NOREPEAT: u32 = 0x4000;
 const VK_A: u32 = 0x41;
 const VK_D: u32 = 0x44;
+const VK_F6: u32 = 0x75;
+const VK_F7: u32 = 0x76;
 const VK_F8: u32 = 0x77;
+const VK_F9: u32 = 0x78;
+const VK_F10: u32 = 0x79;
 const VK_W: u32 = 0x57;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static WINDOW_CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
+thread_local! {
+    static HIGH_RES_WAITABLE_TIMER: WaitableTimer = WaitableTimer::create();
+}
+
+const HOTKEY_PAIR_CANDIDATES: [HotkeyPairCandidate; 5] = [
+    HotkeyPairCandidate {
+        base_vk: VK_F8,
+        key_name: "F8",
+    },
+    HotkeyPairCandidate {
+        base_vk: VK_F7,
+        key_name: "F7",
+    },
+    HotkeyPairCandidate {
+        base_vk: VK_F9,
+        key_name: "F9",
+    },
+    HotkeyPairCandidate {
+        base_vk: VK_F6,
+        key_name: "F6",
+    },
+    HotkeyPairCandidate {
+        base_vk: VK_F10,
+        key_name: "F10",
+    },
+];
 
 #[repr(C)]
 struct VsFixedFileInfo {
@@ -123,6 +169,7 @@ impl Version {
 
 #[derive(Debug)]
 struct AppState {
+    base_dir: PathBuf,
     settings: Settings,
     enabled: AtomicBool,
     a_down: AtomicBool,
@@ -135,18 +182,23 @@ struct AppState {
     cleanup_started: AtomicBool,
     window_handle: AtomicIsize,
     keyboard_hook: AtomicIsize,
-    mouse_hook: AtomicIsize,
+    target_window_active: AtomicBool,
     forward_event: isize,
+    instance_mutex: isize,
+    timer_resolution_enabled: AtomicBool,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
     target_cache: Mutex<TargetWindowCache>,
     forward_key_lock: Mutex<()>,
     send_input_lock: Mutex<()>,
     tray_state: Mutex<TrayState>,
+    hotkeys: Mutex<HotkeyBindings>,
+    forward_key_spec: ForwardKeySpec,
 }
 
 #[derive(Debug, Default)]
 struct TargetWindowCache {
     hwnd: isize,
+    process_id: u32,
     is_match: bool,
 }
 
@@ -157,7 +209,129 @@ struct TrayState {
     added: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug)]
+struct HotkeyPairCandidate {
+    base_vk: u32,
+    key_name: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct HotkeyBindings {
+    toggle_display: Option<String>,
+    exit_display: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForwardKeySpec {
+    virtual_key: u16,
+    scan_code: u16,
+    base_flags: u32,
+}
+
+struct WaitableTimer {
+    handle: isize,
+}
+
+impl Default for HotkeyBindings {
+    fn default() -> Self {
+        Self::bound("F8")
+    }
+}
+
+impl WaitableTimer {
+    fn create() -> Self {
+        let handle = unsafe {
+            CreateWaitableTimerExW(
+                null(),
+                null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        Self {
+            handle: handle as isize,
+        }
+    }
+
+    fn wait_milliseconds(&self, milliseconds: i32) -> bool {
+        if self.handle == 0 {
+            return false;
+        }
+
+        let due_time_100ns = -i64::from(milliseconds).saturating_mul(10_000);
+        let scheduled = unsafe {
+            SetWaitableTimerEx(
+                self.handle as _,
+                &due_time_100ns,
+                0,
+                None,
+                null(),
+                null(),
+                0,
+            )
+        };
+        if scheduled == 0 {
+            return false;
+        }
+
+        unsafe { WaitForSingleObject(self.handle as _, INFINITE) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for WaitableTimer {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe {
+                CloseHandle(self.handle as _);
+            }
+        }
+    }
+}
+
+impl HotkeyBindings {
+    fn bound(key_name: &str) -> Self {
+        Self {
+            toggle_display: Some(key_name.to_string()),
+            exit_display: Some(format!("Ctrl+{key_name}")),
+        }
+    }
+
+    fn tray_only() -> Self {
+        Self {
+            toggle_display: None,
+            exit_display: None,
+        }
+    }
+
+    fn summary_text(&self) -> String {
+        match (&self.toggle_display, &self.exit_display) {
+            (Some(toggle), Some(exit)) => format!("Hotkeys: {toggle} / {exit}"),
+            _ => "Hotkeys: tray menu only".to_string(),
+        }
+    }
+
+    fn toggle_menu_text(&self, enabled: bool) -> String {
+        let action = if enabled {
+            "Disable Assist"
+        } else {
+            "Enable Assist"
+        };
+
+        match &self.toggle_display {
+            Some(toggle) => format!("{action} ({toggle})"),
+            None => action.to_string(),
+        }
+    }
+
+    fn exit_menu_text(&self) -> String {
+        match &self.exit_display {
+            Some(exit) => format!("Exit ({exit})"),
+            None => "Exit".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Settings {
     enabled_on_start: bool,
@@ -173,6 +347,53 @@ struct Settings {
     block_when_forward_held: bool,
     process_names: Vec<String>,
     window_title_contains: Vec<String>,
+}
+
+impl Settings {
+    fn load(base_dir: &Path) -> Self {
+        let path = base_dir.join("tapper.settings.json");
+        let mut should_persist = false;
+        let mut settings = match fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    should_persist = true;
+                    back_up_invalid_settings_file(&path);
+                    write_status("tapper.settings.json was invalid. A clean config was restored.");
+                    Settings::default()
+                }
+            },
+            Err(_) => {
+                should_persist = true;
+                Settings::default()
+            }
+        };
+        let original = settings.clone();
+        settings.normalize();
+        if settings != original {
+            should_persist = true;
+        }
+        if should_persist {
+            persist_settings(&path, &settings);
+        }
+        settings
+    }
+
+    fn normalize(&mut self) {
+        self.forward_tap_hold_ms = self.forward_tap_hold_ms.clamp(1, 25);
+        self.forward_tap_cooldown_ms = self.forward_tap_cooldown_ms.clamp(0, 25);
+        self.forward_tap_burst_count = self.forward_tap_burst_count.clamp(1, 6);
+        self.forward_tap_pulse_gap_ms = self.forward_tap_pulse_gap_ms.clamp(0, 10);
+        self.held_forward_retap_release_ms = self.held_forward_retap_release_ms.clamp(1, 10);
+        self.max_queued_forward_taps = self.max_queued_forward_taps.clamp(1, 64);
+        if !self.trigger_on_wheel_down && !self.trigger_on_wheel_up {
+            self.trigger_on_wheel_down = true;
+        }
+
+        self.process_names = normalize_entries(&self.process_names, &["r5apex.exe"]);
+        self.window_title_contains =
+            normalize_entries(&self.window_title_contains, &["Apex Legends"]);
+    }
 }
 
 impl Default for Settings {
@@ -195,32 +416,60 @@ impl Default for Settings {
     }
 }
 
-impl Settings {
-    fn load(base_dir: &Path) -> Self {
-        let path = base_dir.join("tapper.settings.json");
-        let mut settings = match fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str::<Settings>(&contents).unwrap_or_default(),
-            Err(_) => Settings::default(),
-        };
-        settings.normalize();
-        settings
-    }
-
-    fn normalize(&mut self) {
-        self.forward_tap_hold_ms = self.forward_tap_hold_ms.clamp(1, 25);
-        self.forward_tap_cooldown_ms = self.forward_tap_cooldown_ms.clamp(0, 25);
-        self.forward_tap_burst_count = self.forward_tap_burst_count.clamp(1, 6);
-        self.forward_tap_pulse_gap_ms = self.forward_tap_pulse_gap_ms.clamp(0, 10);
-        self.held_forward_retap_release_ms = self.held_forward_retap_release_ms.clamp(1, 10);
-        self.max_queued_forward_taps = self.max_queued_forward_taps.clamp(1, 64);
-        if !self.trigger_on_wheel_down && !self.trigger_on_wheel_up {
-            self.trigger_on_wheel_down = true;
+fn build_forward_key_spec() -> ForwardKeySpec {
+    let scan_code = unsafe { MapVirtualKeyW(VK_W, MAPVK_VK_TO_VSC) as u16 };
+    if scan_code != 0 {
+        ForwardKeySpec {
+            virtual_key: 0,
+            scan_code,
+            base_flags: KEYEVENTF_SCANCODE,
         }
-
-        self.process_names = normalize_entries(&self.process_names, &["r5apex.exe"]);
-        self.window_title_contains =
-            normalize_entries(&self.window_title_contains, &["Apex Legends"]);
+    } else {
+        ForwardKeySpec {
+            virtual_key: VK_W as u16,
+            scan_code: 0,
+            base_flags: 0,
+        }
     }
+}
+
+fn try_acquire_single_instance() -> Result<Option<isize>, String> {
+    let mutex_name = wide(r"Local\TapperSingleInstanceMutex");
+    let handle = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
+    if handle.is_null() {
+        return Err(last_error_message(
+            "Unable to create the Tapper single-instance mutex.",
+        ));
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(handle as isize))
+}
+
+fn initialize_logging(base_dir: &Path) {
+    let _ = fs::create_dir_all(base_dir);
+    let log_path = base_dir.join("Tapper.log");
+    if let Ok(metadata) = fs::metadata(&log_path)
+        && metadata.len() > 512 * 1024
+    {
+        let _ = fs::remove_file(&log_path);
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(
+            file,
+            "[+{}ms] Tapper {APP_VERSION} log started",
+            monotonic_millis()
+        );
+    }
+
+    let _ = LOG_PATH.set(log_path);
 }
 
 fn main() {
@@ -240,8 +489,22 @@ fn main() {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    initialize_logging(&base_dir);
+
+    let instance_mutex = match try_acquire_single_instance() {
+        Ok(Some(handle)) => handle,
+        Ok(None) => {
+            write_status("Another Tapper instance is already running.");
+            return;
+        }
+        Err(error) => {
+            show_error_message(&error);
+            process::exit(1);
+        }
+    };
+
     let settings = Settings::load(&base_dir);
-    let state = match AppState::new(settings) {
+    let state = match AppState::new(base_dir, settings, instance_mutex) {
         Ok(state) => Arc::new(state),
         Err(error) => {
             show_error_message(&error);
@@ -250,6 +513,7 @@ fn main() {
     };
 
     let _ = APP_STATE.set(state.clone());
+    write_status(&format!("Tapper {APP_VERSION} starting"));
 
     if let Err(error) = initialize_app(&current_exe, &state) {
         cleanup(&state);
@@ -265,7 +529,7 @@ fn main() {
 }
 
 impl AppState {
-    fn new(settings: Settings) -> Result<Self, String> {
+    fn new(base_dir: PathBuf, settings: Settings, instance_mutex: isize) -> Result<Self, String> {
         let forward_event = unsafe { CreateEventW(null(), 0, 0, null()) };
         if forward_event.is_null() {
             return Err(last_error_message(
@@ -273,7 +537,10 @@ impl AppState {
             ));
         }
 
+        let forward_key_spec = build_forward_key_spec();
+
         Ok(Self {
+            base_dir,
             enabled: AtomicBool::new(settings.enabled_on_start),
             settings,
             a_down: AtomicBool::new(false),
@@ -286,13 +553,17 @@ impl AppState {
             cleanup_started: AtomicBool::new(false),
             window_handle: AtomicIsize::new(0),
             keyboard_hook: AtomicIsize::new(0),
-            mouse_hook: AtomicIsize::new(0),
+            target_window_active: AtomicBool::new(false),
             forward_event: forward_event as isize,
+            instance_mutex,
+            timer_resolution_enabled: AtomicBool::new(false),
             worker_handle: Mutex::new(None),
             target_cache: Mutex::new(TargetWindowCache::default()),
             forward_key_lock: Mutex::new(()),
             send_input_lock: Mutex::new(()),
             tray_state: Mutex::new(TrayState::default()),
+            hotkeys: Mutex::new(HotkeyBindings::default()),
+            forward_key_spec,
         })
     }
 
@@ -352,8 +623,24 @@ fn initialize_app(current_exe: &Path, state: &Arc<AppState>) -> Result<(), Strin
     }
 
     state.window_handle.store(hwnd as isize, Ordering::Relaxed);
+    refresh_target_window_state(state);
+    optimize_runtime_for_low_latency(state);
+    if unsafe {
+        SetTimer(
+            hwnd,
+            TARGET_WINDOW_TIMER_ID,
+            TARGET_WINDOW_TIMER_INTERVAL_MS,
+            None,
+        )
+    } == 0
+    {
+        return Err(last_error_message(
+            "Unable to start the target-window refresh timer.",
+        ));
+    }
+    register_raw_mouse_input(hwnd)?;
+    register_hotkeys(state, hwnd);
     add_tray_icon(current_exe, state)?;
-    register_hotkeys(hwnd)?;
     install_hooks(state)?;
     start_forward_tap_worker(state)?;
     update_tray_state(state)?;
@@ -394,6 +681,16 @@ unsafe extern "system" fn window_proc(
             handle_tray_callback(hwnd, lparam as u32);
             0
         }
+        WM_TIMER => {
+            if wparam == TARGET_WINDOW_TIMER_ID {
+                refresh_target_window_state(state());
+            }
+            0
+        }
+        WM_INPUT => {
+            handle_raw_mouse_input(lparam as HRAWINPUT);
+            0
+        }
         WM_CLOSE => {
             unsafe {
                 DestroyWindow(hwnd);
@@ -416,6 +713,44 @@ fn handle_hotkey(hotkey_id: i32) {
         EXIT_HOTKEY_ID => exit_application(),
         _ => {}
     }
+}
+
+fn open_app_directory() {
+    let state = state();
+    let _ = Command::new("explorer.exe")
+        .arg(&state.base_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+fn open_log_file() {
+    if let Some(log_path) = LOG_PATH.get()
+        && log_path.exists()
+    {
+        let _ = Command::new("notepad.exe")
+            .arg(log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    } else {
+        open_app_directory();
+    }
+}
+
+fn open_settings_file() {
+    let settings_path = state().base_dir.join("tapper.settings.json");
+    let _ = Command::new("notepad.exe")
+        .arg(settings_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
 fn handle_tray_callback(hwnd: HWND, event: u32) {
@@ -460,7 +795,7 @@ fn add_tray_icon(current_exe: &Path, state: &AppState) -> Result<(), String> {
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
     data.hIcon = icon as HICON;
-    copy_utf16_buffer(&build_tray_text(state.is_enabled()), &mut data.szTip);
+    copy_utf16_buffer(&build_tray_text(state), &mut data.szTip);
 
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
     if added == 0 {
@@ -490,7 +825,7 @@ fn update_tray_state(state: &AppState) -> Result<(), String> {
     data.hWnd = state.window();
     data.uID = TRAY_ICON_ID;
     data.uFlags = NIF_TIP;
-    copy_utf16_buffer(&build_tray_text(state.is_enabled()), &mut data.szTip);
+    copy_utf16_buffer(&build_tray_text(state), &mut data.szTip);
 
     let updated = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
     if updated == 0 {
@@ -535,12 +870,13 @@ fn show_tray_menu(hwnd: HWND) {
     } else {
         "Assist: disabled"
     });
-    let toggle_text = wide(if state.is_enabled() {
-        "Disable Assist (F8)"
-    } else {
-        "Enable Assist (F8)"
-    });
-    let exit_text = wide("Exit (Ctrl+F8)");
+    let hotkeys = state.hotkeys.lock().unwrap().clone();
+    let hotkey_text = wide(hotkeys.summary_text());
+    let folder_text = wide("Open App Folder");
+    let log_text = wide("Open Log");
+    let settings_text = wide("Open Settings");
+    let toggle_text = wide(hotkeys.toggle_menu_text(state.is_enabled()));
+    let exit_text = wide(hotkeys.exit_menu_text());
 
     unsafe {
         AppendMenuW(
@@ -548,6 +884,31 @@ fn show_tray_menu(hwnd: HWND) {
             MF_STRING | MF_DISABLED | MF_GRAYED,
             0,
             status_text.as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            0,
+            hotkey_text.as_ptr(),
+        );
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_OPEN_FOLDER_ID as usize,
+            folder_text.as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_OPEN_LOG_ID as usize,
+            log_text.as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_OPEN_SETTINGS_ID as usize,
+            settings_text.as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(
@@ -575,6 +936,12 @@ fn show_tray_menu(hwnd: HWND) {
 
         if command as u32 == MENU_TOGGLE_ID {
             toggle_assist();
+        } else if command as u32 == MENU_OPEN_FOLDER_ID {
+            open_app_directory();
+        } else if command as u32 == MENU_OPEN_LOG_ID {
+            open_log_file();
+        } else if command as u32 == MENU_OPEN_SETTINGS_ID {
+            open_settings_file();
         } else if command as u32 == MENU_EXIT_ID {
             exit_application();
         }
@@ -584,22 +951,65 @@ fn show_tray_menu(hwnd: HWND) {
     }
 }
 
-fn register_hotkeys(hwnd: HWND) -> Result<(), String> {
-    let toggle = unsafe { RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, MOD_NOREPEAT, VK_F8) };
-    if toggle == 0 {
-        return Err(last_error_message(
-            "Unable to register the F8 toggle hotkey.",
-        ));
+fn register_hotkeys(state: &AppState, hwnd: HWND) {
+    for candidate in HOTKEY_PAIR_CANDIDATES {
+        let toggle =
+            unsafe { RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, MOD_NOREPEAT, candidate.base_vk) };
+        if toggle == 0 {
+            continue;
+        }
+
+        let exit = unsafe {
+            RegisterHotKey(
+                hwnd,
+                EXIT_HOTKEY_ID,
+                MOD_CONTROL | MOD_NOREPEAT,
+                candidate.base_vk,
+            )
+        };
+        if exit == 0 {
+            unsafe {
+                UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
+            }
+            continue;
+        }
+
+        *state.hotkeys.lock().unwrap() = HotkeyBindings::bound(candidate.key_name);
+        if candidate.base_vk != VK_F8 {
+            write_status(&format!(
+                "F8 was unavailable. Using {} / Ctrl+{} instead.",
+                candidate.key_name, candidate.key_name
+            ));
+        }
+        return;
     }
 
-    let exit = unsafe { RegisterHotKey(hwnd, EXIT_HOTKEY_ID, MOD_CONTROL | MOD_NOREPEAT, VK_F8) };
-    if exit == 0 {
-        unsafe {
-            UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
-        }
-        return Err(last_error_message(
-            "Unable to register the Ctrl+F8 exit hotkey.",
-        ));
+    *state.hotkeys.lock().unwrap() = HotkeyBindings::tray_only();
+    write_status("Global hotkeys were unavailable. Use the tray menu to control Tapper.");
+}
+
+fn optimize_runtime_for_low_latency(state: &AppState) {
+    if unsafe { timeBeginPeriod(1) } == 0 {
+        state
+            .timer_resolution_enabled
+            .store(true, Ordering::Relaxed);
+    }
+}
+
+fn optimize_worker_thread_for_low_latency() {}
+
+fn register_raw_mouse_input(hwnd: HWND) -> Result<(), String> {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+
+    let registered =
+        unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) };
+    if registered == 0 {
+        return Err(last_error_message("Unable to register raw mouse input."));
     }
 
     Ok(())
@@ -614,20 +1024,9 @@ fn install_hooks(state: &AppState) -> Result<(), String> {
         return Err(last_error_message("Unable to install the keyboard hook."));
     }
 
-    let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), module, 0) };
-    if mouse_hook.is_null() {
-        unsafe {
-            UnhookWindowsHookEx(keyboard_hook);
-        }
-        return Err(last_error_message("Unable to install the mouse hook."));
-    }
-
     state
         .keyboard_hook
         .store(keyboard_hook as isize, Ordering::Relaxed);
-    state
-        .mouse_hook
-        .store(mouse_hook as isize, Ordering::Relaxed);
     Ok(())
 }
 
@@ -664,16 +1063,15 @@ unsafe extern "system" fn keyboard_hook_proc(
     unsafe { CallNextHookEx(null_mut(), n_code, wparam, lparam) }
 }
 
-unsafe extern "system" fn mouse_hook_proc(n_code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if n_code >= 0 && (wparam as u32) == WM_MOUSEWHEEL {
-        let data = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
-        let wheel_delta = get_wheel_delta(data.mouseData);
-        if should_trigger_for_wheel_delta(wheel_delta) && should_send_forward_tap() {
-            queue_forward_tap_burst();
-        }
-    }
+fn handle_raw_mouse_input(raw_input_handle: HRAWINPUT) {
+    let wheel_delta = match try_get_wheel_delta_from_raw_input(raw_input_handle) {
+        Some(value) => value,
+        None => return,
+    };
 
-    unsafe { CallNextHookEx(null_mut(), n_code, wparam, lparam) }
+    if should_trigger_for_wheel_delta(wheel_delta) && should_send_forward_tap() {
+        queue_forward_tap_burst();
+    }
 }
 
 fn should_trigger_for_wheel_delta(wheel_delta: i16) -> bool {
@@ -705,7 +1103,7 @@ fn should_send_forward_tap() -> bool {
         return false;
     }
 
-    if !is_target_window_active(state) {
+    if !state.target_window_active.load(Ordering::Relaxed) {
         return false;
     }
 
@@ -723,7 +1121,10 @@ fn start_forward_tap_worker(state: &Arc<AppState>) -> Result<(), String> {
     let worker_state = state.clone();
     let handle = thread::Builder::new()
         .name("TapperForwardTapWorker".to_string())
-        .spawn(move || forward_tap_worker_loop(&worker_state))
+        .spawn(move || {
+            optimize_worker_thread_for_low_latency();
+            forward_tap_worker_loop(&worker_state);
+        })
         .map_err(|error| format!("Unable to start the forward-tap worker: {error}"))?;
 
     *state.worker_handle.lock().unwrap() = Some(handle);
@@ -765,10 +1166,14 @@ fn queue_forward_tap_burst() {
     } else {
         state.settings.forward_tap_burst_count
     };
+    let max_live_burst_taps = state
+        .settings
+        .forward_tap_burst_count
+        .clamp(1, state.settings.max_queued_forward_taps);
     let max_queued_taps = if queue_single_held_forward_tap {
         1
     } else {
-        state.settings.max_queued_forward_taps
+        max_live_burst_taps
     };
 
     loop {
@@ -780,11 +1185,13 @@ fn queue_forward_tap_burst() {
         let target = std::cmp::min(max_queued_taps, current + tap_count);
         if state
             .queued_forward_taps
-            .compare_exchange(current, target, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(current, target, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            unsafe {
-                SetEvent(state.forward_event as _);
+            if current == 0 {
+                unsafe {
+                    SetEvent(state.forward_event as _);
+                }
             }
             return;
         }
@@ -800,7 +1207,7 @@ fn try_take_queued_forward_tap(state: &AppState) -> bool {
 
         if state
             .queued_forward_taps
-            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
             return true;
@@ -823,7 +1230,14 @@ fn can_process_queued_forward_tap(state: &AppState) -> bool {
         return false;
     }
 
-    is_target_window_active(state)
+    state.target_window_active.load(Ordering::Relaxed)
+}
+
+fn refresh_target_window_state(state: &AppState) {
+    let is_active = is_target_window_active(state);
+    state
+        .target_window_active
+        .store(is_active, Ordering::Relaxed);
 }
 
 fn is_target_window_active(state: &AppState) -> bool {
@@ -832,22 +1246,28 @@ fn is_target_window_active(state: &AppState) -> bool {
         return false;
     }
 
+    let process_id = get_window_process_id(window_handle);
+    if process_id == 0 {
+        return false;
+    }
+
     {
         let cache = state.target_cache.lock().unwrap();
-        if cache.hwnd == window_handle as isize {
+        if cache.hwnd == window_handle as isize && cache.process_id == process_id {
             return cache.is_match;
         }
     }
 
-    let matches_target = matches_target_window(state, window_handle);
+    let matches_target = matches_target_window(state, window_handle, process_id);
     let mut cache = state.target_cache.lock().unwrap();
     cache.hwnd = window_handle as isize;
+    cache.process_id = process_id;
     cache.is_match = matches_target;
     matches_target
 }
 
-fn matches_target_window(state: &AppState, window_handle: HWND) -> bool {
-    let process_name = try_get_foreground_process_name(window_handle);
+fn matches_target_window(state: &AppState, window_handle: HWND, process_id: u32) -> bool {
+    let process_name = try_get_foreground_process_name(process_id);
     if matches_configured_process(&state.settings, &process_name) {
         return true;
     }
@@ -856,15 +1276,7 @@ fn matches_target_window(state: &AppState, window_handle: HWND) -> bool {
     matches_configured_title(&state.settings, &title)
 }
 
-fn try_get_foreground_process_name(window_handle: HWND) -> String {
-    let mut process_id = 0_u32;
-    unsafe {
-        GetWindowThreadProcessId(window_handle, &mut process_id);
-    }
-    if process_id == 0 {
-        return String::new();
-    }
-
+fn try_get_foreground_process_name(process_id: u32) -> String {
     query_process_image_path(process_id)
         .and_then(|path| {
             Path::new(&path)
@@ -921,38 +1333,32 @@ fn normalize_process_name(name: &str) -> String {
 fn send_forward_tap(state: &AppState) {
     let _forward_key_guard = state.forward_key_lock.lock().unwrap();
     if !state.settings.block_when_forward_held && state.w_down.load(Ordering::Relaxed) {
-        send_keyboard_input(VK_W as u16, true);
+        send_forward_key_input(state, true);
         delay_milliseconds_precise(state.settings.held_forward_retap_release_ms);
-        send_keyboard_input(VK_W as u16, false);
+        send_forward_key_input(state, false);
         state.synthetic_forward_held.store(true, Ordering::Relaxed);
         return;
     }
 
     release_synthetic_forward_hold_if_needed_no_lock(state);
-    send_keyboard_input(VK_W as u16, false);
+    send_forward_key_input(state, false);
     delay_milliseconds_precise(state.settings.forward_tap_hold_ms);
-    send_keyboard_input(VK_W as u16, true);
+    send_forward_key_input(state, true);
 }
 
-fn send_keyboard_input(virtual_key: u16, key_up: bool) {
-    let state = state();
+fn send_forward_key_input(state: &AppState, key_up: bool) {
     let _send_input_guard = state.send_input_lock.lock().unwrap();
-
-    let mut virtual_key = virtual_key;
-    let scan_code = unsafe { MapVirtualKeyW(virtual_key as u32, MAPVK_VK_TO_VSC) as u16 };
-    let mut flags = if key_up { KEYEVENTF_KEYUP } else { 0 };
-
-    if scan_code != 0 {
-        flags |= KEYEVENTF_SCANCODE;
-        virtual_key = 0;
+    let mut flags = state.forward_key_spec.base_flags;
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
     }
 
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: virtual_key,
-                wScan: scan_code,
+                wVk: state.forward_key_spec.virtual_key,
+                wScan: state.forward_key_spec.scan_code,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
@@ -973,15 +1379,12 @@ fn delay_milliseconds_precise(milliseconds: i32) {
         return;
     }
 
-    let target = Duration::from_millis(milliseconds as u64);
-    let start = Instant::now();
-    if milliseconds > 2 {
-        thread::sleep(Duration::from_millis((milliseconds - 1) as u64));
+    let waited = HIGH_RES_WAITABLE_TIMER.with(|timer| timer.wait_milliseconds(milliseconds));
+    if waited {
+        return;
     }
 
-    while start.elapsed() < target {
-        std::hint::spin_loop();
-    }
+    thread::sleep(Duration::from_millis(milliseconds as u64));
 }
 
 fn release_synthetic_forward_hold_if_needed() {
@@ -995,7 +1398,7 @@ fn release_synthetic_forward_hold_if_needed_no_lock(state: &AppState) {
         return;
     }
 
-    send_keyboard_input(VK_W as u16, true);
+    send_forward_key_input(state, true);
     state.synthetic_forward_held.store(false, Ordering::Relaxed);
 }
 
@@ -1023,6 +1426,7 @@ fn cleanup(state: &AppState) {
     let hwnd = state.window();
     if !hwnd.is_null() {
         unsafe {
+            KillTimer(hwnd, TARGET_WINDOW_TIMER_ID);
             UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
             UnregisterHotKey(hwnd, EXIT_HOTKEY_ID);
         }
@@ -1035,18 +1439,26 @@ fn cleanup(state: &AppState) {
         }
     }
 
-    let mouse_hook = state.mouse_hook.swap(0, Ordering::Relaxed) as HHOOK;
-    if !mouse_hook.is_null() {
-        unsafe {
-            UnhookWindowsHookEx(mouse_hook);
-        }
-    }
-
     remove_tray_icon(state);
 
     if state.forward_event != 0 {
         unsafe {
             CloseHandle(state.forward_event as _);
+        }
+    }
+
+    if state.instance_mutex != 0 {
+        unsafe {
+            CloseHandle(state.instance_mutex as _);
+        }
+    }
+
+    if state
+        .timer_resolution_enabled
+        .swap(false, Ordering::Relaxed)
+    {
+        unsafe {
+            timeEndPeriod(1);
         }
     }
 
@@ -1062,18 +1474,46 @@ fn write_status(message: &str) {
     unsafe {
         OutputDebugStringW(wide_message.as_ptr());
     }
+
+    if let Some(log_path) = LOG_PATH.get()
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path)
+    {
+        let _ = writeln!(file, "[+{}ms] {}", monotonic_millis(), message);
+    }
+}
+
+fn back_up_invalid_settings_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+
+    let backup_path = path.with_file_name("tapper.settings.invalid.json");
+    let _ = fs::remove_file(&backup_path);
+    let _ = fs::rename(path, backup_path);
+}
+
+fn persist_settings(path: &Path, settings: &Settings) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(serialized) = serde_json::to_string_pretty(settings) {
+        let _ = fs::write(path, format!("{serialized}\r\n"));
+    }
 }
 
 fn state() -> &'static Arc<AppState> {
     APP_STATE.get().expect("app state not initialized")
 }
 
-fn build_tray_text(enabled: bool) -> String {
-    if enabled {
-        "Tapper - enabled".to_string()
+fn build_tray_text(state: &AppState) -> String {
+    let enabled = if state.is_enabled() {
+        "enabled"
     } else {
-        "Tapper - disabled".to_string()
-    }
+        "disabled"
+    };
+    let hotkeys = state.hotkeys.lock().unwrap().summary_text();
+    format!("Tapper {APP_VERSION} - {enabled} - {hotkeys}")
 }
 
 fn load_application_icon(current_exe: &Path) -> (isize, bool) {
@@ -1091,8 +1531,59 @@ fn monotonic_millis() -> i64 {
     START_TIME.get_or_init(Instant::now).elapsed().as_millis() as i64
 }
 
-fn get_wheel_delta(mouse_data: u32) -> i16 {
-    ((mouse_data >> 16) & 0xFFFF) as u16 as i16
+fn try_get_wheel_delta_from_raw_input(raw_input_handle: HRAWINPUT) -> Option<i16> {
+    let mut size = 0_u32;
+    let size_result = unsafe {
+        GetRawInputData(
+            raw_input_handle,
+            RID_INPUT,
+            null_mut(),
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if size_result == u32::MAX || size < size_of::<RAWINPUT>() as u32 {
+        return None;
+    }
+
+    let mut buffer = vec![0_u8; size as usize];
+    let data_result = unsafe {
+        GetRawInputData(
+            raw_input_handle,
+            RID_INPUT,
+            buffer.as_mut_ptr() as *mut c_void,
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if data_result == u32::MAX || data_result < size_of::<RAWINPUT>() as u32 {
+        return None;
+    }
+
+    let raw_input = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
+    if raw_input.header.dwType != RIM_TYPEMOUSE {
+        return None;
+    }
+
+    let mouse = unsafe { raw_input.data.mouse };
+    let button_state = unsafe { mouse.Anonymous.Anonymous };
+    wheel_delta_from_raw_mouse(button_state.usButtonFlags, button_state.usButtonData)
+}
+
+fn wheel_delta_from_raw_mouse(button_flags: u16, button_data: u16) -> Option<i16> {
+    if (u32::from(button_flags) & RI_MOUSE_WHEEL) == 0 {
+        return None;
+    }
+
+    Some(button_data as i16)
+}
+
+fn get_window_process_id(window_handle: HWND) -> u32 {
+    let mut process_id = 0_u32;
+    unsafe {
+        GetWindowThreadProcessId(window_handle, &mut process_id);
+    }
+    process_id
 }
 
 fn query_process_image_path(process_id: u32) -> Option<String> {
@@ -1298,6 +1789,8 @@ $sourceDirectoryPath = '{source_directory}'
 $targetDirectoryPath = '{target_directory}'
 $targetExecutablePath = '{target_executable}'
 $currentProcessId = {current_process_id}
+$stagingDirectoryPath = Join-Path ([System.IO.Path]::GetTempPath()) ('TapperStage-' + [Guid]::NewGuid().ToString('N'))
+$backupDirectoryPath = Join-Path ([System.IO.Path]::GetTempPath()) ('TapperBackup-' + [Guid]::NewGuid().ToString('N'))
 
 function Test-SamePath {{
     param(
@@ -1329,25 +1822,68 @@ foreach ($targetProcess in $targetProcesses) {{
     Stop-Process -Id $targetProcess.Id -Force -ErrorAction SilentlyContinue
 }}
 
-if ($targetProcesses.Count -gt 0) {{
-    Start-Sleep -Milliseconds 400
+foreach ($targetProcess in $targetProcesses) {{
+    Wait-Process -Id $targetProcess.Id -Timeout 5 -ErrorAction SilentlyContinue
 }}
 
-New-Item -ItemType Directory -Path $targetDirectoryPath -Force | Out-Null
+function Remove-TapperInstallContent {{
+    param([string]$path)
 
-Get-ChildItem -LiteralPath $sourceDirectoryPath -Force | ForEach-Object {{
-    $destinationPath = Join-Path $targetDirectoryPath $_.Name
+    Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Where-Object {{
+        -not $_.Name.StartsWith('unins', [System.StringComparison]::OrdinalIgnoreCase)
+    }} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}}
 
-    if ([string]::Equals($_.Name, 'tapper.settings.json', [System.StringComparison]::OrdinalIgnoreCase) -and
-        (Test-Path -LiteralPath $destinationPath)) {{
-        return
+try {{
+    New-Item -ItemType Directory -Path $stagingDirectoryPath -Force | Out-Null
+
+    Get-ChildItem -LiteralPath $sourceDirectoryPath -Force | ForEach-Object {{
+        $destinationPath = Join-Path $stagingDirectoryPath $_.Name
+        Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
     }}
 
-    Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
+    foreach ($requiredName in @('Tapper.exe', 'tapper.settings.json', 'README.md')) {{
+        if (-not (Test-Path (Join-Path $stagingDirectoryPath $requiredName))) {{
+            throw ('Missing staged file: ' + $requiredName)
+        }}
+    }}
+
+    New-Item -ItemType Directory -Path $targetDirectoryPath -Force | Out-Null
+    New-Item -ItemType Directory -Path $backupDirectoryPath -Force | Out-Null
+
+    Get-ChildItem -LiteralPath $targetDirectoryPath -Force -ErrorAction SilentlyContinue | Where-Object {{
+        -not $_.Name.StartsWith('unins', [System.StringComparison]::OrdinalIgnoreCase)
+    }} | ForEach-Object {{
+        Move-Item -LiteralPath $_.FullName -Destination (Join-Path $backupDirectoryPath $_.Name) -Force
+    }}
+
+    Get-ChildItem -LiteralPath $stagingDirectoryPath -Force | ForEach-Object {{
+        $destinationPath = Join-Path $targetDirectoryPath $_.Name
+        Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
+    }}
+
+    if (-not (Test-Path $targetExecutablePath)) {{
+        throw 'Updated Tapper.exe was not copied into place.'
+    }}
+}}
+catch {{
+    Remove-TapperInstallContent -path $targetDirectoryPath
+
+    if (Test-Path $backupDirectoryPath) {{
+        Get-ChildItem -LiteralPath $backupDirectoryPath -Force -ErrorAction SilentlyContinue | ForEach-Object {{
+            Move-Item -LiteralPath $_.FullName -Destination (Join-Path $targetDirectoryPath $_.Name) -Force
+        }}
+    }}
+
+    throw
+}}
+finally {{
+    Remove-Item -LiteralPath $stagingDirectoryPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backupDirectoryPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }}
 
 Start-Process -FilePath $targetExecutablePath | Out-Null
-Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 "#,
         source_directory = escape_powershell_literal(source_directory),
         target_directory = escape_powershell_literal(target_directory),
@@ -1455,6 +1991,86 @@ fn show_error_message(message: &str) {
             body.as_ptr(),
             title.as_ptr(),
             MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_parse_fills_missing_parts_with_zero() {
+        assert_eq!(
+            Version::parse("1.2"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 0,
+                build: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_entries_deduplicates_and_falls_back() {
+        let values = vec![
+            " r5apex.exe ".to_string(),
+            "R5APEX.EXE".to_string(),
+            "".to_string(),
+        ];
+        assert_eq!(
+            normalize_entries(&values, &["fallback.exe"]),
+            vec!["r5apex.exe"]
+        );
+        assert_eq!(
+            normalize_entries(&[], &["fallback.exe"]),
+            vec!["fallback.exe"]
+        );
+    }
+
+    #[test]
+    fn normalize_path_is_case_and_separator_insensitive() {
+        assert_eq!(
+            normalize_path(Path::new(r"C:/Games/Tapper/Tapper.exe")),
+            normalize_path(Path::new(r"c:\games\tapper\Tapper.exe"))
+        );
+    }
+
+    #[test]
+    fn escape_powershell_literal_doubles_single_quotes() {
+        assert_eq!(
+            escape_powershell_literal(Path::new(r"C:\O'Reilly\Tapper")),
+            "C:\\O''Reilly\\Tapper"
+        );
+    }
+
+    #[test]
+    fn update_script_uses_staging_and_rollback() {
+        let script = build_installed_copy_update_script(
+            Path::new(r"C:\Source"),
+            Path::new(r"C:\Installed"),
+            Path::new(r"C:\Installed\Tapper.exe"),
+            42,
+        );
+
+        assert!(script.contains("$stagingDirectoryPath"));
+        assert!(script.contains("$backupDirectoryPath"));
+        assert!(script.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $backupDirectoryPath $_.Name) -Force"));
+        assert!(script.contains("Remove-TapperInstallContent -path $targetDirectoryPath"));
+        assert!(script.contains("throw ('Missing staged file: ' + $requiredName)"));
+    }
+
+    #[test]
+    fn wheel_delta_parser_only_accepts_wheel_messages() {
+        assert_eq!(wheel_delta_from_raw_mouse(0, 120), None);
+        assert_eq!(
+            wheel_delta_from_raw_mouse(RI_MOUSE_WHEEL as u16, 120),
+            Some(120)
+        );
+        assert_eq!(
+            wheel_delta_from_raw_mouse(RI_MOUSE_WHEEL as u16, (-120i16) as u16),
+            Some(-120)
         );
     }
 }

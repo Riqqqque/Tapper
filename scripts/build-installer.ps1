@@ -65,6 +65,10 @@ New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
+& $cargoPath generate-lockfile `
+    --manifest-path $manifestPath `
+    --offline
+
 & $cargoPath build `
     --manifest-path $manifestPath `
     --target $Target `

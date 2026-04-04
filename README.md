@@ -17,6 +17,7 @@ The app is now built as a native Rust executable and does not need the .NET runt
 
 - `F8`: toggle the assist on or off
 - `Ctrl+F8`: close the helper
+- If another app already owns `F8`, Tapper automatically falls back to a nearby function-key pair or keeps working from the tray menu.
 
 ## Use
 
@@ -24,16 +25,21 @@ The app is now built as a native Rust executable and does not need the .NET runt
 2. Install Tapper with `TapperSetup-<version>.exe`, or run the built `Tapper.exe` directly if you are testing locally.
 3. Tapper starts in the system tray on launch so it stays out of the way.
 4. When you want the assist, leave it enabled and use `A` or `D` with your mouse turn as usual.
+5. Launching Tapper again does not stack another copy on top of the running one.
 
 ## Installer
 
 - Run `scripts\build-installer.ps1` to build the Rust release, refresh `dist`, and compile the setup exe.
 - The shareable installer is written to `installer-dist\TapperSetup-<version>.exe`.
 - The installer defaults to `%LocalAppData%\Tapper`, creates a Start Menu shortcut, and can optionally add a desktop shortcut or startup shortcut.
+- Upgrades fully refresh the installed Tapper files and bundled config so stale runtime files do not linger between versions.
 
 ## Config
 
 Edit `tapper.settings.json` next to the executable if you want to tune it.
+
+Tapper writes a simple `Tapper.log` file next to the executable, and the tray menu can open the app folder, log, or settings file directly.
+If the config file is missing or invalid, Tapper restores a clean one automatically and keeps the bad file as `tapper.settings.invalid.json`.
 
 - `forwardTapHoldMs`: how long the injected `W` press stays down
 - `forwardTapCooldownMs`: minimum gap between wheel events before another burst can queue

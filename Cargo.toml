@@ -1,6 +1,6 @@
 [package]
 name = "tapper"
-version = "1.0.9"
+version = "1.0.19"
 edition = "2024"
 description = "Small Windows helper for Apex tap-strafing with Mouse Wheel."
 build = "build.rs"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 windows-sys = { version = "0.61.2", features = [
+  "Win32_Media",
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Security",
@@ -22,6 +23,7 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Threading",
   "Win32_System_SystemInformation",
+  "Win32_UI_Input",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
