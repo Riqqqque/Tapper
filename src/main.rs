@@ -35,8 +35,9 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MAPVK_VK_TO_VSC, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey,
+    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, RegisterHotKey, SendInput,
+    UnregisterHotKey,
 };
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
@@ -52,8 +53,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HHOOK, HICON, IDC_ARROW,
     IDI_APPLICATION, KBDLLHOOKSTRUCT, KillTimer, LLKHF_INJECTED, LoadCursorW, LoadIconW,
     MB_ICONERROR, MB_OK, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RI_MOUSE_WHEEL, RegisterClassW, SetForegroundWindow, SetTimer,
-    SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    PostMessageW, PostQuitMessage, RI_MOUSE_WHEEL, RIM_INPUT, RegisterClassW, SetForegroundWindow,
+    SetTimer, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
     WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NULL,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
@@ -543,9 +544,9 @@ impl AppState {
             base_dir,
             enabled: AtomicBool::new(settings.enabled_on_start),
             settings,
-            a_down: AtomicBool::new(false),
-            d_down: AtomicBool::new(false),
-            w_down: AtomicBool::new(false),
+            a_down: AtomicBool::new(is_key_down(VK_A)),
+            d_down: AtomicBool::new(is_key_down(VK_D)),
+            w_down: AtomicBool::new(is_key_down(VK_W)),
             last_tap_at_ms: AtomicI64::new(0),
             queued_forward_taps: AtomicI32::new(0),
             synthetic_forward_held: AtomicBool::new(false),
@@ -689,7 +690,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_INPUT => {
             handle_raw_mouse_input(lparam as HRAWINPUT);
-            0
+            if wparam == RIM_INPUT as usize {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            } else {
+                0
+            }
         }
         WM_CLOSE => {
             unsafe {
@@ -1327,7 +1332,11 @@ fn matches_configured_title(settings: &Settings, candidate: &str) -> bool {
 }
 
 fn normalize_process_name(name: &str) -> String {
-    name.trim_end_matches(".exe").to_ascii_lowercase()
+    let lower_name = name.trim().to_ascii_lowercase();
+    lower_name
+        .strip_suffix(".exe")
+        .unwrap_or(&lower_name)
+        .to_string()
 }
 
 fn send_forward_tap(state: &AppState) {
@@ -1532,26 +1541,13 @@ fn monotonic_millis() -> i64 {
 }
 
 fn try_get_wheel_delta_from_raw_input(raw_input_handle: HRAWINPUT) -> Option<i16> {
-    let mut size = 0_u32;
-    let size_result = unsafe {
-        GetRawInputData(
-            raw_input_handle,
-            RID_INPUT,
-            null_mut(),
-            &mut size,
-            size_of::<RAWINPUTHEADER>() as u32,
-        )
-    };
-    if size_result == u32::MAX || size < size_of::<RAWINPUT>() as u32 {
-        return None;
-    }
-
-    let mut buffer = vec![0_u8; size as usize];
+    let mut raw_input = RAWINPUT::default();
+    let mut size = size_of::<RAWINPUT>() as u32;
     let data_result = unsafe {
         GetRawInputData(
             raw_input_handle,
             RID_INPUT,
-            buffer.as_mut_ptr() as *mut c_void,
+            (&mut raw_input as *mut RAWINPUT).cast(),
             &mut size,
             size_of::<RAWINPUTHEADER>() as u32,
         )
@@ -1560,7 +1556,6 @@ fn try_get_wheel_delta_from_raw_input(raw_input_handle: HRAWINPUT) -> Option<i16
         return None;
     }
 
-    let raw_input = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
     if raw_input.header.dwType != RIM_TYPEMOUSE {
         return None;
     }
@@ -1576,6 +1571,10 @@ fn wheel_delta_from_raw_mouse(button_flags: u16, button_data: u16) -> Option<i16
     }
 
     Some(button_data as i16)
+}
+
+fn is_key_down(virtual_key: u32) -> bool {
+    unsafe { (GetAsyncKeyState(virtual_key as i32) & i16::MIN) != 0 }
 }
 
 fn get_window_process_id(window_handle: HWND) -> u32 {
@@ -2027,6 +2026,13 @@ mod tests {
             normalize_entries(&[], &["fallback.exe"]),
             vec!["fallback.exe"]
         );
+    }
+
+    #[test]
+    fn normalize_process_name_strips_exe_case_insensitively() {
+        assert_eq!(normalize_process_name(" R5APEX.EXE "), "r5apex");
+        assert_eq!(normalize_process_name("r5apex.exe"), "r5apex");
+        assert_eq!(normalize_process_name("r5apex"), "r5apex");
     }
 
     #[test]
