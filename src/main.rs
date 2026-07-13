@@ -51,13 +51,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HHOOK, HICON, IDC_ARROW,
-    IDI_APPLICATION, KBDLLHOOKSTRUCT, KillTimer, LLKHF_INJECTED, LoadCursorW, LoadIconW,
-    MB_ICONERROR, MB_OK, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RI_MOUSE_WHEEL, RIM_INPUT, RegisterClassW, SetForegroundWindow,
-    SetTimer, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK,
+    MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW,
+    PostQuitMessage, RI_MOUSE_WHEEL, RIM_INPUT, RegisterClassW, SetForegroundWindow,
+    SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
     WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
@@ -69,8 +69,9 @@ const MENU_OPEN_FOLDER_ID: u32 = 1003;
 const MENU_OPEN_LOG_ID: u32 = 1004;
 const MENU_OPEN_SETTINGS_ID: u32 = 1005;
 const TRAY_ICON_ID: u32 = 1;
-const TARGET_WINDOW_TIMER_ID: usize = 1;
-const TARGET_WINDOW_TIMER_INTERVAL_MS: u32 = 16;
+const TARGET_WINDOW_CACHE_TTL_MS: i64 = 250;
+const SEND_INPUT_ERROR_LOG_INTERVAL_MS: i64 = 1_000;
+const KEY_STATE_RETRY_COUNT: usize = 3;
 const MOD_CONTROL: u32 = 0x0002;
 const MOD_NOREPEAT: u32 = 0x4000;
 const VK_A: u32 = 0x41;
@@ -154,16 +155,21 @@ struct Version {
 
 impl Version {
     fn parse(value: &str) -> Option<Self> {
-        let mut parts = value.split('.').map(|part| part.parse::<u16>().ok());
-        let major = parts.next().flatten()?;
-        let minor = parts.next().flatten().unwrap_or(0);
-        let patch = parts.next().flatten().unwrap_or(0);
-        let build = parts.next().flatten().unwrap_or(0);
+        let parts = value.split('.').collect::<Vec<_>>();
+        if parts.is_empty() || parts.len() > 4 || parts.iter().any(|part| part.is_empty()) {
+            return None;
+        }
+
+        let mut parsed = [0_u16; 4];
+        for (index, part) in parts.iter().enumerate() {
+            parsed[index] = part.parse().ok()?;
+        }
+
         Some(Self {
-            major,
-            minor,
-            patch,
-            build,
+            major: parsed[0],
+            minor: parsed[1],
+            patch: parsed[2],
+            build: parsed[3],
         })
     }
 }
@@ -183,7 +189,7 @@ struct AppState {
     cleanup_started: AtomicBool,
     window_handle: AtomicIsize,
     keyboard_hook: AtomicIsize,
-    target_window_active: AtomicBool,
+    last_send_input_error_at_ms: AtomicI64,
     forward_event: isize,
     instance_mutex: isize,
     timer_resolution_enabled: AtomicBool,
@@ -201,6 +207,7 @@ struct TargetWindowCache {
     hwnd: isize,
     process_id: u32,
     is_match: bool,
+    checked_at_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -554,7 +561,7 @@ impl AppState {
             cleanup_started: AtomicBool::new(false),
             window_handle: AtomicIsize::new(0),
             keyboard_hook: AtomicIsize::new(0),
-            target_window_active: AtomicBool::new(false),
+            last_send_input_error_at_ms: AtomicI64::new(-SEND_INPUT_ERROR_LOG_INTERVAL_MS),
             forward_event: forward_event as isize,
             instance_mutex,
             timer_resolution_enabled: AtomicBool::new(false),
@@ -624,21 +631,7 @@ fn initialize_app(current_exe: &Path, state: &Arc<AppState>) -> Result<(), Strin
     }
 
     state.window_handle.store(hwnd as isize, Ordering::Relaxed);
-    refresh_target_window_state(state);
     optimize_runtime_for_low_latency(state);
-    if unsafe {
-        SetTimer(
-            hwnd,
-            TARGET_WINDOW_TIMER_ID,
-            TARGET_WINDOW_TIMER_INTERVAL_MS,
-            None,
-        )
-    } == 0
-    {
-        return Err(last_error_message(
-            "Unable to start the target-window refresh timer.",
-        ));
-    }
     register_raw_mouse_input(hwnd)?;
     register_hotkeys(state, hwnd);
     add_tray_icon(current_exe, state)?;
@@ -682,12 +675,6 @@ unsafe extern "system" fn window_proc(
             handle_tray_callback(hwnd, lparam as u32);
             0
         }
-        WM_TIMER => {
-            if wparam == TARGET_WINDOW_TIMER_ID {
-                refresh_target_window_state(state());
-            }
-            0
-        }
         WM_INPUT => {
             handle_raw_mouse_input(lparam as HRAWINPUT);
             if wparam == RIM_INPUT as usize {
@@ -698,7 +685,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_CLOSE => {
             unsafe {
-                DestroyWindow(hwnd);
+                PostQuitMessage(0);
             }
             0
         }
@@ -1001,8 +988,6 @@ fn optimize_runtime_for_low_latency(state: &AppState) {
     }
 }
 
-fn optimize_worker_thread_for_low_latency() {}
-
 fn register_raw_mouse_input(hwnd: HWND) -> Result<(), String> {
     let device = RAWINPUTDEVICE {
         usUsagePage: 0x01,
@@ -1108,7 +1093,7 @@ fn should_send_forward_tap() -> bool {
         return false;
     }
 
-    if !state.target_window_active.load(Ordering::Relaxed) {
+    if !refresh_target_window_state(state) {
         return false;
     }
 
@@ -1127,7 +1112,6 @@ fn start_forward_tap_worker(state: &Arc<AppState>) -> Result<(), String> {
     let handle = thread::Builder::new()
         .name("TapperForwardTapWorker".to_string())
         .spawn(move || {
-            optimize_worker_thread_for_low_latency();
             forward_tap_worker_loop(&worker_state);
         })
         .map_err(|error| format!("Unable to start the forward-tap worker: {error}"))?;
@@ -1235,14 +1219,11 @@ fn can_process_queued_forward_tap(state: &AppState) -> bool {
         return false;
     }
 
-    state.target_window_active.load(Ordering::Relaxed)
+    refresh_target_window_state(state)
 }
 
-fn refresh_target_window_state(state: &AppState) {
-    let is_active = is_target_window_active(state);
-    state
-        .target_window_active
-        .store(is_active, Ordering::Relaxed);
+fn refresh_target_window_state(state: &AppState) -> bool {
+    is_target_window_active(state)
 }
 
 fn is_target_window_active(state: &AppState) -> bool {
@@ -1256,9 +1237,13 @@ fn is_target_window_active(state: &AppState) -> bool {
         return false;
     }
 
+    let now = monotonic_millis();
     {
         let cache = state.target_cache.lock().unwrap();
-        if cache.hwnd == window_handle as isize && cache.process_id == process_id {
+        if cache.hwnd == window_handle as isize
+            && cache.process_id == process_id
+            && now.saturating_sub(cache.checked_at_ms) < TARGET_WINDOW_CACHE_TTL_MS
+        {
             return cache.is_match;
         }
     }
@@ -1268,6 +1253,7 @@ fn is_target_window_active(state: &AppState) -> bool {
     cache.hwnd = window_handle as isize;
     cache.process_id = process_id;
     cache.is_match = matches_target;
+    cache.checked_at_ms = now;
     matches_target
 }
 
@@ -1342,20 +1328,44 @@ fn normalize_process_name(name: &str) -> String {
 fn send_forward_tap(state: &AppState) {
     let _forward_key_guard = state.forward_key_lock.lock().unwrap();
     if !state.settings.block_when_forward_held && state.w_down.load(Ordering::Relaxed) {
-        send_forward_key_input(state, true);
+        if !send_forward_key_input(state, true) {
+            return;
+        }
+
         delay_milliseconds_precise(state.settings.held_forward_retap_release_ms);
-        send_forward_key_input(state, false);
-        state.synthetic_forward_held.store(true, Ordering::Relaxed);
+        if state.w_down.load(Ordering::Relaxed) {
+            let restored = send_forward_key_input_with_retry(state, false);
+            state
+                .synthetic_forward_held
+                .store(restored, Ordering::Relaxed);
+        } else {
+            state.synthetic_forward_held.store(false, Ordering::Relaxed);
+        }
         return;
     }
 
     release_synthetic_forward_hold_if_needed_no_lock(state);
-    send_forward_key_input(state, false);
+    if !send_forward_key_input(state, false) {
+        return;
+    }
+
+    state.synthetic_forward_held.store(true, Ordering::Relaxed);
     delay_milliseconds_precise(state.settings.forward_tap_hold_ms);
-    send_forward_key_input(state, true);
+    release_synthetic_forward_hold_if_needed_no_lock(state);
 }
 
-fn send_forward_key_input(state: &AppState, key_up: bool) {
+fn send_forward_key_input_with_retry(state: &AppState, key_up: bool) -> bool {
+    for _ in 0..KEY_STATE_RETRY_COUNT {
+        if send_forward_key_input(state, key_up) {
+            return true;
+        }
+        thread::yield_now();
+    }
+
+    false
+}
+
+fn send_forward_key_input(state: &AppState, key_up: bool) -> bool {
     let _send_input_guard = state.send_input_lock.lock().unwrap();
     let mut flags = state.forward_key_spec.base_flags;
     if key_up {
@@ -1376,11 +1386,25 @@ fn send_forward_key_input(state: &AppState, key_up: bool) {
     };
 
     let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
-    if sent != 1 {
-        write_status(&format!("SendInput failed with {}", unsafe {
-            GetLastError()
-        }));
+    if sent == 1 {
+        return true;
     }
+
+    log_send_input_failure(state, unsafe { GetLastError() });
+    false
+}
+
+fn log_send_input_failure(state: &AppState, error: u32) {
+    let now = monotonic_millis();
+    let previous = state.last_send_input_error_at_ms.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < SEND_INPUT_ERROR_LOG_INTERVAL_MS {
+        return;
+    }
+
+    state
+        .last_send_input_error_at_ms
+        .store(now, Ordering::Relaxed);
+    write_status(&format!("SendInput failed with {error}"));
 }
 
 fn delay_milliseconds_precise(milliseconds: i32) {
@@ -1407,8 +1431,21 @@ fn release_synthetic_forward_hold_if_needed_no_lock(state: &AppState) {
         return;
     }
 
-    send_forward_key_input(state, true);
-    state.synthetic_forward_held.store(false, Ordering::Relaxed);
+    if state.w_down.load(Ordering::Relaxed) {
+        state.synthetic_forward_held.store(false, Ordering::Relaxed);
+        return;
+    }
+
+    if send_forward_key_input_with_retry(state, true) {
+        state.synthetic_forward_held.store(false, Ordering::Relaxed);
+
+        if state.w_down.load(Ordering::Relaxed) {
+            let restored = send_forward_key_input_with_retry(state, false);
+            state
+                .synthetic_forward_held
+                .store(restored, Ordering::Relaxed);
+        }
+    }
 }
 
 fn cleanup(state: &AppState) {
@@ -1435,7 +1472,6 @@ fn cleanup(state: &AppState) {
     let hwnd = state.window();
     if !hwnd.is_null() {
         unsafe {
-            KillTimer(hwnd, TARGET_WINDOW_TIMER_ID);
             UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
             UnregisterHotKey(hwnd, EXIT_HOTKEY_ID);
         }
@@ -1449,6 +1485,12 @@ fn cleanup(state: &AppState) {
     }
 
     remove_tray_icon(state);
+
+    if !hwnd.is_null() {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+    }
 
     if state.forward_event != 0 {
         unsafe {
@@ -1605,7 +1647,9 @@ fn query_process_image_path(process_id: u32) -> Option<String> {
 }
 
 fn try_hand_off_to_installed_copy(current_exe: &Path) -> bool {
-    let installed_exe = get_installed_executable_path();
+    let Some(installed_exe) = get_installed_executable_path() else {
+        return false;
+    };
     let installed_dir = match installed_exe.parent() {
         Some(path) => path,
         None => return false,
@@ -1630,17 +1674,16 @@ fn try_hand_off_to_installed_copy(current_exe: &Path) -> bool {
     try_start_installed_copy_update(current_exe, &installed_exe)
 }
 
-fn get_installed_executable_path() -> PathBuf {
+fn get_installed_executable_path() -> Option<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("USERPROFILE")
                 .map(PathBuf::from)
                 .map(|path| path.join("AppData").join("Local"))
-        })
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Local"));
+        })?;
 
-    local_app_data.join("Tapper").join("Tapper.exe")
+    Some(local_app_data.join("Tapper").join("Tapper.exe"))
 }
 
 fn get_executable_version(executable_path: &Path) -> Version {
@@ -1738,6 +1781,7 @@ fn try_start_installed_copy_update(source_executable: &Path, target_executable: 
     ));
 
     let script = build_installed_copy_update_script(
+        source_executable,
         source_directory,
         target_directory,
         target_executable,
@@ -1777,6 +1821,7 @@ fn try_start_installed_copy_update(source_executable: &Path, target_executable: 
 }
 
 fn build_installed_copy_update_script(
+    source_executable: &Path,
     source_directory: &Path,
     target_directory: &Path,
     target_executable: &Path,
@@ -1784,12 +1829,15 @@ fn build_installed_copy_update_script(
 ) -> String {
     format!(
         r#"$ErrorActionPreference = 'Stop'
+$sourceExecutablePath = '{source_executable}'
 $sourceDirectoryPath = '{source_directory}'
 $targetDirectoryPath = '{target_directory}'
 $targetExecutablePath = '{target_executable}'
 $currentProcessId = {current_process_id}
 $stagingDirectoryPath = Join-Path ([System.IO.Path]::GetTempPath()) ('TapperStage-' + [Guid]::NewGuid().ToString('N'))
 $backupDirectoryPath = Join-Path ([System.IO.Path]::GetTempPath()) ('TapperBackup-' + [Guid]::NewGuid().ToString('N'))
+$installMutationStarted = $false
+$targetProcessesStopped = $false
 
 function Test-SamePath {{
     param(
@@ -1817,14 +1865,6 @@ $targetProcesses = @(Get-Process -Name $targetProcessName -ErrorAction SilentlyC
     }}
 }})
 
-foreach ($targetProcess in $targetProcesses) {{
-    Stop-Process -Id $targetProcess.Id -Force -ErrorAction SilentlyContinue
-}}
-
-foreach ($targetProcess in $targetProcesses) {{
-    Wait-Process -Id $targetProcess.Id -Timeout 5 -ErrorAction SilentlyContinue
-}}
-
 function Remove-TapperInstallContent {{
     param([string]$path)
 
@@ -1836,19 +1876,38 @@ function Remove-TapperInstallContent {{
 try {{
     New-Item -ItemType Directory -Path $stagingDirectoryPath -Force | Out-Null
 
-    Get-ChildItem -LiteralPath $sourceDirectoryPath -Force | ForEach-Object {{
-        $destinationPath = Join-Path $stagingDirectoryPath $_.Name
-        Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
+    Copy-Item -LiteralPath $sourceExecutablePath -Destination (Join-Path $stagingDirectoryPath 'Tapper.exe') -Force
+    foreach ($optionalName in @('tapper.settings.json', 'README.md')) {{
+        $optionalSourcePath = Join-Path $sourceDirectoryPath $optionalName
+        if (Test-Path -LiteralPath $optionalSourcePath) {{
+            Copy-Item -LiteralPath $optionalSourcePath -Destination (Join-Path $stagingDirectoryPath $optionalName) -Force
+        }}
     }}
 
-    foreach ($requiredName in @('Tapper.exe', 'tapper.settings.json', 'README.md')) {{
-        if (-not (Test-Path (Join-Path $stagingDirectoryPath $requiredName))) {{
-            throw ('Missing staged file: ' + $requiredName)
-        }}
+    $sourceLogoPath = Join-Path $sourceDirectoryPath 'assets\logo.png'
+    if (Test-Path -LiteralPath $sourceLogoPath) {{
+        $stagedAssetsPath = Join-Path $stagingDirectoryPath 'assets'
+        New-Item -ItemType Directory -Path $stagedAssetsPath -Force | Out-Null
+        Copy-Item -LiteralPath $sourceLogoPath -Destination (Join-Path $stagedAssetsPath 'logo.png') -Force
+    }}
+
+    if (-not (Test-Path -LiteralPath (Join-Path $stagingDirectoryPath 'Tapper.exe'))) {{
+        throw 'Tapper.exe was not staged.'
     }}
 
     New-Item -ItemType Directory -Path $targetDirectoryPath -Force | Out-Null
     New-Item -ItemType Directory -Path $backupDirectoryPath -Force | Out-Null
+
+    foreach ($targetProcess in $targetProcesses) {{
+        Stop-Process -Id $targetProcess.Id -Force -ErrorAction SilentlyContinue
+    }}
+
+    foreach ($targetProcess in $targetProcesses) {{
+        Wait-Process -Id $targetProcess.Id -Timeout 5 -ErrorAction SilentlyContinue
+    }}
+
+    $targetProcessesStopped = $targetProcesses.Count -gt 0
+    $installMutationStarted = $true
 
     Get-ChildItem -LiteralPath $targetDirectoryPath -Force -ErrorAction SilentlyContinue | Where-Object {{
         -not $_.Name.StartsWith('unins', [System.StringComparison]::OrdinalIgnoreCase)
@@ -1861,17 +1920,25 @@ try {{
         Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
     }}
 
-    if (-not (Test-Path $targetExecutablePath)) {{
+    if (-not (Test-Path -LiteralPath $targetExecutablePath)) {{
         throw 'Updated Tapper.exe was not copied into place.'
     }}
+
+    Start-Process -FilePath $targetExecutablePath -ErrorAction Stop | Out-Null
 }}
 catch {{
-    Remove-TapperInstallContent -path $targetDirectoryPath
+    if ($installMutationStarted) {{
+        Remove-TapperInstallContent -path $targetDirectoryPath
 
-    if (Test-Path $backupDirectoryPath) {{
-        Get-ChildItem -LiteralPath $backupDirectoryPath -Force -ErrorAction SilentlyContinue | ForEach-Object {{
-            Move-Item -LiteralPath $_.FullName -Destination (Join-Path $targetDirectoryPath $_.Name) -Force
+        if (Test-Path -LiteralPath $backupDirectoryPath) {{
+            Get-ChildItem -LiteralPath $backupDirectoryPath -Force -ErrorAction SilentlyContinue | ForEach-Object {{
+                Move-Item -LiteralPath $_.FullName -Destination (Join-Path $targetDirectoryPath $_.Name) -Force
+            }}
         }}
+    }}
+
+    if ($targetProcessesStopped -and (Test-Path -LiteralPath $targetExecutablePath)) {{
+        Start-Process -FilePath $targetExecutablePath -ErrorAction SilentlyContinue | Out-Null
     }}
 
     throw
@@ -1882,8 +1949,8 @@ finally {{
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }}
 
-Start-Process -FilePath $targetExecutablePath | Out-Null
 "#,
+        source_executable = escape_powershell_literal(source_executable),
         source_directory = escape_powershell_literal(source_directory),
         target_directory = escape_powershell_literal(target_directory),
         target_executable = escape_powershell_literal(target_executable),
@@ -2009,6 +2076,9 @@ mod tests {
                 build: 0,
             })
         );
+        assert_eq!(Version::parse("1.bad"), None);
+        assert_eq!(Version::parse("1.2.3.4.5"), None);
+        assert_eq!(Version::parse("1..3"), None);
     }
 
     #[test]
@@ -2054,6 +2124,7 @@ mod tests {
     #[test]
     fn update_script_uses_staging_and_rollback() {
         let script = build_installed_copy_update_script(
+            Path::new(r"C:\Source\RenamedTapper.exe"),
             Path::new(r"C:\Source"),
             Path::new(r"C:\Installed"),
             Path::new(r"C:\Installed\Tapper.exe"),
@@ -2062,9 +2133,23 @@ mod tests {
 
         assert!(script.contains("$stagingDirectoryPath"));
         assert!(script.contains("$backupDirectoryPath"));
+        assert!(script.contains("$installMutationStarted = $false"));
+        assert!(script.contains("$targetProcessesStopped = $false"));
+        assert!(script.contains("if ($installMutationStarted)"));
+        assert!(script.contains(
+            "if ($targetProcessesStopped -and (Test-Path -LiteralPath $targetExecutablePath))"
+        ));
+        assert!(script.contains(r"$sourceExecutablePath = 'C:\Source\RenamedTapper.exe'"));
+        assert!(!script.contains("Get-ChildItem -LiteralPath $sourceDirectoryPath -Force"));
+        assert!(
+            script
+                .find("Copy-Item -LiteralPath $sourceExecutablePath")
+                .unwrap()
+                < script.find("Stop-Process -Id $targetProcess.Id").unwrap()
+        );
         assert!(script.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $backupDirectoryPath $_.Name) -Force"));
         assert!(script.contains("Remove-TapperInstallContent -path $targetDirectoryPath"));
-        assert!(script.contains("throw ('Missing staged file: ' + $requiredName)"));
+        assert!(script.contains("throw 'Tapper.exe was not staged.'"));
     }
 
     #[test]
