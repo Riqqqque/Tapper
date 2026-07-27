@@ -1259,12 +1259,16 @@ fn is_target_window_active(state: &AppState) -> bool {
 
 fn matches_target_window(state: &AppState, window_handle: HWND, process_id: u32) -> bool {
     let process_name = try_get_foreground_process_name(process_id);
-    if matches_configured_process(&state.settings, &process_name) {
-        return true;
+    let title = try_get_window_title(window_handle);
+    matches_target_identity(&state.settings, &process_name, &title)
+}
+
+fn matches_target_identity(settings: &Settings, process_name: &str, title: &str) -> bool {
+    if !process_name.trim().is_empty() {
+        return matches_configured_process(settings, process_name);
     }
 
-    let title = try_get_window_title(window_handle);
-    matches_configured_title(&state.settings, &title)
+    matches_configured_title(settings, title)
 }
 
 fn try_get_foreground_process_name(process_id: u32) -> String {
@@ -1838,6 +1842,8 @@ $stagingDirectoryPath = Join-Path ([System.IO.Path]::GetTempPath()) ('TapperStag
 $backupDirectoryPath = Join-Path ([System.IO.Path]::GetTempPath()) ('TapperBackup-' + [Guid]::NewGuid().ToString('N'))
 $installMutationStarted = $false
 $targetProcessesStopped = $false
+$preserveBackup = $false
+$rollbackSucceeded = $true
 
 function Test-SamePath {{
     param(
@@ -1927,25 +1933,35 @@ try {{
     Start-Process -FilePath $targetExecutablePath -ErrorAction Stop | Out-Null
 }}
 catch {{
-    if ($installMutationStarted) {{
-        Remove-TapperInstallContent -path $targetDirectoryPath
+    $updateError = $_
 
-        if (Test-Path -LiteralPath $backupDirectoryPath) {{
-            Get-ChildItem -LiteralPath $backupDirectoryPath -Force -ErrorAction SilentlyContinue | ForEach-Object {{
-                Move-Item -LiteralPath $_.FullName -Destination (Join-Path $targetDirectoryPath $_.Name) -Force
+    if ($installMutationStarted) {{
+        try {{
+            Remove-TapperInstallContent -path $targetDirectoryPath
+
+            if (Test-Path -LiteralPath $backupDirectoryPath) {{
+                Get-ChildItem -LiteralPath $backupDirectoryPath -Force -ErrorAction SilentlyContinue | ForEach-Object {{
+                    Move-Item -LiteralPath $_.FullName -Destination (Join-Path $targetDirectoryPath $_.Name) -Force
+                }}
             }}
+        }}
+        catch {{
+            $preserveBackup = $true
+            $rollbackSucceeded = $false
         }}
     }}
 
-    if ($targetProcessesStopped -and (Test-Path -LiteralPath $targetExecutablePath)) {{
+    if ($targetProcessesStopped -and $rollbackSucceeded -and (Test-Path -LiteralPath $targetExecutablePath)) {{
         Start-Process -FilePath $targetExecutablePath -ErrorAction SilentlyContinue | Out-Null
     }}
 
-    throw
+    throw $updateError
 }}
 finally {{
     Remove-Item -LiteralPath $stagingDirectoryPath -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $backupDirectoryPath -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $preserveBackup) {{
+        Remove-Item -LiteralPath $backupDirectoryPath -Recurse -Force -ErrorAction SilentlyContinue
+    }}
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }}
 
@@ -2106,6 +2122,23 @@ mod tests {
     }
 
     #[test]
+    fn target_identity_only_uses_title_when_process_lookup_fails() {
+        let settings = Settings::default();
+
+        assert!(matches_target_identity(
+            &settings,
+            "r5apex.exe",
+            "Apex Legends"
+        ));
+        assert!(!matches_target_identity(
+            &settings,
+            "chrome.exe",
+            "Apex Legends - Google Chrome"
+        ));
+        assert!(matches_target_identity(&settings, "", "Apex Legends"));
+    }
+
+    #[test]
     fn normalize_path_is_case_and_separator_insensitive() {
         assert_eq!(
             normalize_path(Path::new(r"C:/Games/Tapper/Tapper.exe")),
@@ -2135,9 +2168,11 @@ mod tests {
         assert!(script.contains("$backupDirectoryPath"));
         assert!(script.contains("$installMutationStarted = $false"));
         assert!(script.contains("$targetProcessesStopped = $false"));
+        assert!(script.contains("$preserveBackup = $false"));
+        assert!(script.contains("$rollbackSucceeded = $true"));
         assert!(script.contains("if ($installMutationStarted)"));
         assert!(script.contains(
-            "if ($targetProcessesStopped -and (Test-Path -LiteralPath $targetExecutablePath))"
+            "if ($targetProcessesStopped -and $rollbackSucceeded -and (Test-Path -LiteralPath $targetExecutablePath))"
         ));
         assert!(script.contains(r"$sourceExecutablePath = 'C:\Source\RenamedTapper.exe'"));
         assert!(!script.contains("Get-ChildItem -LiteralPath $sourceDirectoryPath -Force"));
@@ -2149,6 +2184,9 @@ mod tests {
         );
         assert!(script.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $backupDirectoryPath $_.Name) -Force"));
         assert!(script.contains("Remove-TapperInstallContent -path $targetDirectoryPath"));
+        assert!(script.contains("if (-not $preserveBackup)"));
+        assert!(script.contains("$rollbackSucceeded = $false"));
+        assert!(script.contains("throw $updateError"));
         assert!(script.contains("throw 'Tapper.exe was not staged.'"));
     }
 
