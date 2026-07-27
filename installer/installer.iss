@@ -56,7 +56,7 @@ Name: "{autodesktop}\Tapper"; Filename: "{app}\Tapper.exe"; IconFilename: "{app}
 Name: "{userstartup}\Tapper"; Filename: "{app}\Tapper.exe"; IconFilename: "{app}\Tapper.exe"; Tasks: startupicon
 
 [Run]
-Filename: "{app}\Tapper.exe"; Flags: nowait
+Filename: "{app}\Tapper.exe"; Description: "Launch Tapper"; Flags: nowait postinstall skipifsilent
 
 [Code]
 

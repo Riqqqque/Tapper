@@ -1,6 +1,6 @@
 [package]
 name = "tapper"
-version = "1.0.22"
+version = "1.0.23"
 edition = "2024"
 description = "Small Windows helper for Apex tap-strafing with Mouse Wheel."
 build = "build.rs"
@@ -10,8 +10,8 @@ name = "Tapper"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Media",
   "Win32_Foundation",
