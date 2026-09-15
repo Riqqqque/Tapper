@@ -1,6 +1,6 @@
 [package]
 name = "tapper"
-version = "1.0.23"
+version = "1.0.24"
 edition = "2024"
 description = "Small Windows helper for Apex tap-strafing with Mouse Wheel."
 build = "build.rs"

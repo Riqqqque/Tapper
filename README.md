@@ -12,6 +12,7 @@ The app is now built as a native Rust executable and does not need the .NET runt
 - Sends a short burst of `W` taps alongside each wheel-up or wheel-down notch.
 - Only triggers when the target Apex window is active.
 - Only triggers while `A` or `D` is held.
+- Recognizes both the DirectX 11 (`r5apex.exe`) and DirectX 12 (`r5apex_dx12.exe`) game executables.
 
 ## Controls
 

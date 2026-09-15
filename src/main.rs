@@ -84,6 +84,7 @@ const VK_F10: u32 = 0x79;
 const VK_W: u32 = 0x57;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_TARGET_PROCESS_NAMES: [&str; 2] = ["r5apex.exe", "r5apex_dx12.exe"];
 
 static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -398,7 +399,8 @@ impl Settings {
             self.trigger_on_wheel_down = true;
         }
 
-        self.process_names = normalize_entries(&self.process_names, &["r5apex.exe"]);
+        self.process_names =
+            normalize_entries_with_required(&self.process_names, &DEFAULT_TARGET_PROCESS_NAMES);
         self.window_title_contains =
             normalize_entries(&self.window_title_contains, &["Apex Legends"]);
     }
@@ -418,7 +420,10 @@ impl Default for Settings {
             trigger_on_wheel_up: true,
             require_strafe_key: true,
             block_when_forward_held: false,
-            process_names: vec!["r5apex.exe".to_string()],
+            process_names: DEFAULT_TARGET_PROCESS_NAMES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
             window_title_contains: vec!["Apex Legends".to_string()],
         }
     }
@@ -2028,6 +2033,12 @@ fn normalize_entries(values: &[String], fallback: &[&str]) -> Vec<String> {
     }
 }
 
+fn normalize_entries_with_required(values: &[String], required: &[&str]) -> Vec<String> {
+    let mut combined = values.to_vec();
+    combined.extend(required.iter().map(|value| (*value).to_string()));
+    normalize_entries(&combined, required)
+}
+
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -2115,6 +2126,21 @@ mod tests {
     }
 
     #[test]
+    fn settings_normalization_adds_supported_apex_executables() {
+        let mut settings = Settings {
+            process_names: vec!["r5apex.exe".to_string()],
+            ..Settings::default()
+        };
+
+        settings.normalize();
+
+        assert_eq!(
+            settings.process_names,
+            vec!["r5apex.exe", "r5apex_dx12.exe"]
+        );
+    }
+
+    #[test]
     fn normalize_process_name_strips_exe_case_insensitively() {
         assert_eq!(normalize_process_name(" R5APEX.EXE "), "r5apex");
         assert_eq!(normalize_process_name("r5apex.exe"), "r5apex");
@@ -2128,6 +2154,11 @@ mod tests {
         assert!(matches_target_identity(
             &settings,
             "r5apex.exe",
+            "Apex Legends"
+        ));
+        assert!(matches_target_identity(
+            &settings,
+            "r5apex_dx12.exe",
             "Apex Legends"
         ));
         assert!(!matches_target_identity(

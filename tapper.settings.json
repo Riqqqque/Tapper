@@ -11,7 +11,8 @@
   "requireStrafeKey": true,
   "blockWhenForwardHeld": false,
   "processNames": [
-    "r5apex.exe"
+    "r5apex.exe",
+    "r5apex_dx12.exe"
   ],
   "windowTitleContains": [
     "Apex Legends"
