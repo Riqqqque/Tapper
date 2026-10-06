@@ -1,8 +1,10 @@
 [package]
 name = "tapper"
-version = "1.0.24"
+version = "1.0.25"
 edition = "2024"
 description = "Small Windows helper for Apex tap-strafing with Mouse Wheel."
+license = "MIT"
+repository = "https://github.com/Riqqqque/Tapper"
 build = "build.rs"
 
 [[bin]]

@@ -5,14 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::thread_local;
@@ -48,12 +48,13 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HHOOK, HICON, IDC_ARROW,
-    IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK,
-    MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RI_MOUSE_WHEEL, RIM_INPUT, RegisterClassW, SetForegroundWindow,
+    AppendMenuW, CallNextHookEx, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HHOOK, HICON, IDC_ARROW, IDI_APPLICATION, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, LoadCursorW, LoadIconW, MB_ICONERROR, MB_OK, MF_DISABLED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, MSGFLT_ALLOW, MessageBoxW, PostMessageW, PostQuitMessage,
+    RI_MOUSE_WHEEL, RIM_INPUT, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
     SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
     WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NULL,
@@ -69,6 +70,8 @@ const MENU_OPEN_FOLDER_ID: u32 = 1003;
 const MENU_OPEN_LOG_ID: u32 = 1004;
 const MENU_OPEN_SETTINGS_ID: u32 = 1005;
 const TRAY_ICON_ID: u32 = 1;
+const TRAY_ADD_ATTEMPTS: u32 = 5;
+const TRAY_ADD_RETRY_DELAY_MS: u64 = 1_000;
 const TARGET_WINDOW_CACHE_TTL_MS: i64 = 250;
 const SEND_INPUT_ERROR_LOG_INTERVAL_MS: i64 = 1_000;
 const KEY_STATE_RETRY_COUNT: usize = 3;
@@ -90,6 +93,7 @@ static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static WINDOW_CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
+static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 thread_local! {
     static HIGH_RES_WAITABLE_TIMER: WaitableTimer = WaitableTimer::create();
 }
@@ -362,19 +366,28 @@ impl Settings {
     fn load(base_dir: &Path) -> Self {
         let path = base_dir.join("tapper.settings.json");
         let mut should_persist = false;
-        let mut settings = match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
-                Ok(parsed) => parsed,
-                Err(_) => {
+        let mut settings = match fs::read(&path) {
+            Ok(contents) => match parse_settings(&contents) {
+                Some(parsed) => parsed,
+                None => {
                     should_persist = true;
                     back_up_invalid_settings_file(&path);
                     write_status("tapper.settings.json was invalid. A clean config was restored.");
                     Settings::default()
                 }
             },
-            Err(_) => {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
                 should_persist = true;
                 Settings::default()
+            }
+            Err(error) => {
+                // Leave the file alone: it may only be locked by an editor or sync tool.
+                write_status(&format!(
+                    "Unable to read tapper.settings.json ({error}). Using defaults until restart."
+                ));
+                let mut settings = Settings::default();
+                settings.normalize();
+                return settings;
             }
         };
         let original = settings.clone();
@@ -427,6 +440,38 @@ impl Default for Settings {
             window_title_contains: vec!["Apex Legends".to_string()],
         }
     }
+}
+
+fn parse_settings(contents: &[u8]) -> Option<Settings> {
+    let text = decode_settings_text(contents)?;
+    serde_json::from_str(&text).ok()
+}
+
+// Notepad and PowerShell can save UTF-8 with a BOM or UTF-16, so accept those too.
+fn decode_settings_text(contents: &[u8]) -> Option<String> {
+    if let Some(rest) = contents.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(rest.to_vec()).ok();
+    }
+    if let Some(rest) = contents.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16_bytes(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = contents.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16_bytes(rest, u16::from_be_bytes);
+    }
+
+    String::from_utf8(contents.to_vec()).ok()
+}
+
+fn decode_utf16_bytes(contents: &[u8], to_unit: fn([u8; 2]) -> u16) -> Option<String> {
+    if !contents.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let units = contents
+        .chunks_exact(2)
+        .map(|pair| to_unit([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
 }
 
 fn build_forward_key_spec() -> ForwardKeySpec {
@@ -636,6 +681,7 @@ fn initialize_app(current_exe: &Path, state: &Arc<AppState>) -> Result<(), Strin
     }
 
     state.window_handle.store(hwnd as isize, Ordering::Relaxed);
+    register_taskbar_created_message(hwnd);
     optimize_runtime_for_low_latency(state);
     register_raw_mouse_input(hwnd)?;
     register_hotkeys(state, hwnd);
@@ -698,6 +744,10 @@ unsafe extern "system" fn window_proc(
             unsafe {
                 PostQuitMessage(0);
             }
+            0
+        }
+        _ if is_taskbar_created_message(message) => {
+            restore_tray_icon(state());
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
@@ -783,8 +833,7 @@ fn exit_application() {
     }
 }
 
-fn add_tray_icon(current_exe: &Path, state: &AppState) -> Result<(), String> {
-    let (icon, icon_owned) = load_application_icon(current_exe);
+fn build_tray_add_data(state: &AppState, icon: isize) -> NOTIFYICONDATAW {
     let mut data: NOTIFYICONDATAW = unsafe { zeroed() };
     data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = state.window();
@@ -793,15 +842,33 @@ fn add_tray_icon(current_exe: &Path, state: &AppState) -> Result<(), String> {
     data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
     data.hIcon = icon as HICON;
     copy_utf16_buffer(&build_tray_text(state), &mut data.szTip);
+    data
+}
 
-    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
-    if added == 0 {
+fn add_tray_icon(current_exe: &Path, state: &AppState) -> Result<(), String> {
+    let (icon, icon_owned) = load_application_icon(current_exe);
+    let data = build_tray_add_data(state, icon);
+
+    // Right after sign-in the shell can briefly reject new tray icons.
+    let mut added = false;
+    for attempt in 0..TRAY_ADD_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(TRAY_ADD_RETRY_DELAY_MS));
+        }
+        if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } != 0 {
+            added = true;
+            break;
+        }
+    }
+
+    if !added {
+        let error = last_error_message("Unable to add the Tapper tray icon.");
         if icon_owned && icon != 0 {
             unsafe {
                 DestroyIcon(icon as HICON);
             }
         }
-        return Err(last_error_message("Unable to add the Tapper tray icon."));
+        return Err(error);
     }
 
     let mut tray_state = state.tray_state.lock().unwrap();
@@ -809,6 +876,46 @@ fn add_tray_icon(current_exe: &Path, state: &AppState) -> Result<(), String> {
     tray_state.icon_owned = icon_owned;
     tray_state.added = true;
     Ok(())
+}
+
+fn register_taskbar_created_message(hwnd: HWND) {
+    let message_name = wide("TaskbarCreated");
+    let message = unsafe { RegisterWindowMessageW(message_name.as_ptr()) };
+    if message == 0 {
+        return;
+    }
+
+    // Lets the message through if Tapper was started elevated.
+    unsafe {
+        ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, null_mut());
+    }
+    TASKBAR_CREATED_MESSAGE.store(message, Ordering::Relaxed);
+}
+
+fn is_taskbar_created_message(message: u32) -> bool {
+    let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Relaxed);
+    taskbar_created != 0 && message == taskbar_created
+}
+
+// Explorer drops every tray icon when it restarts, so add ours back.
+fn restore_tray_icon(state: &AppState) {
+    let mut tray_state = state.tray_state.lock().unwrap();
+    if tray_state.icon == 0 {
+        return;
+    }
+
+    let data = build_tray_add_data(state, tray_state.icon);
+    let restored = unsafe {
+        Shell_NotifyIconW(NIM_ADD, &data) != 0 || Shell_NotifyIconW(NIM_MODIFY, &data) != 0
+    };
+    tray_state.added = restored;
+    drop(tray_state);
+
+    write_status(if restored {
+        "tray icon restored after the taskbar restarted"
+    } else {
+        "unable to restore the tray icon after the taskbar restarted"
+    });
 }
 
 fn update_tray_state(state: &AppState) -> Result<(), String> {
@@ -1659,12 +1766,10 @@ fn try_hand_off_to_installed_copy(current_exe: &Path) -> bool {
     let Some(installed_exe) = get_installed_executable_path() else {
         return false;
     };
-    let installed_dir = match installed_exe.parent() {
-        Some(path) => path,
-        None => return false,
-    };
 
-    if !installed_dir.exists() || paths_equal(current_exe, &installed_exe) {
+    // A leftover folder without Tapper.exe (for example the log after an uninstall) is not an
+    // install, so a portable copy should just run instead of installing itself there.
+    if !installed_exe.is_file() || paths_equal(current_exe, &installed_exe) {
         return false;
     }
 
@@ -1672,7 +1777,7 @@ fn try_hand_off_to_installed_copy(current_exe: &Path) -> bool {
     let installed_version = get_executable_version(&installed_exe);
     let installed_copy_running = is_process_running_from_path(&installed_exe);
 
-    if installed_exe.exists() && current_version <= installed_version {
+    if current_version <= installed_version {
         if installed_copy_running {
             return true;
         }
@@ -1888,10 +1993,18 @@ try {{
     New-Item -ItemType Directory -Path $stagingDirectoryPath -Force | Out-Null
 
     Copy-Item -LiteralPath $sourceExecutablePath -Destination (Join-Path $stagingDirectoryPath 'Tapper.exe') -Force
-    foreach ($optionalName in @('tapper.settings.json', 'README.md')) {{
+    foreach ($optionalName in @('README.md', 'LICENSE')) {{
         $optionalSourcePath = Join-Path $sourceDirectoryPath $optionalName
         if (Test-Path -LiteralPath $optionalSourcePath) {{
             Copy-Item -LiteralPath $optionalSourcePath -Destination (Join-Path $stagingDirectoryPath $optionalName) -Force
+        }}
+    }}
+
+    # Keep the user's installed settings; only seed them from the new copy on a fresh install.
+    foreach ($settingsPath in @((Join-Path $targetDirectoryPath 'tapper.settings.json'), (Join-Path $sourceDirectoryPath 'tapper.settings.json'))) {{
+        if (Test-Path -LiteralPath $settingsPath) {{
+            Copy-Item -LiteralPath $settingsPath -Destination (Join-Path $stagingDirectoryPath 'tapper.settings.json') -Force
+            break
         }}
     }}
 
@@ -2219,6 +2332,67 @@ mod tests {
         assert!(script.contains("$rollbackSucceeded = $false"));
         assert!(script.contains("throw $updateError"));
         assert!(script.contains("throw 'Tapper.exe was not staged.'"));
+    }
+
+    #[test]
+    fn update_script_keeps_installed_settings() {
+        let script = build_installed_copy_update_script(
+            Path::new(r"C:\Source\Tapper.exe"),
+            Path::new(r"C:\Source"),
+            Path::new(r"C:\Installed"),
+            Path::new(r"C:\Installed\Tapper.exe"),
+            42,
+        );
+
+        let installed_settings = script
+            .find("(Join-Path $targetDirectoryPath 'tapper.settings.json')")
+            .unwrap();
+        let source_settings = script
+            .find("(Join-Path $sourceDirectoryPath 'tapper.settings.json')")
+            .unwrap();
+        assert!(installed_settings < source_settings);
+        assert!(!script.contains("@('tapper.settings.json', 'README.md')"));
+    }
+
+    #[test]
+    fn settings_parse_accepts_bom_and_utf16_files() {
+        let custom = Settings {
+            forward_tap_burst_count: 4,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string_pretty(&custom).unwrap();
+
+        let utf8_bom = [&[0xEF, 0xBB, 0xBF][..], json.as_bytes()].concat();
+        let utf16_le = [0xFF_u8, 0xFE]
+            .into_iter()
+            .chain(json.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect::<Vec<_>>();
+        let utf16_be = [0xFE_u8, 0xFF]
+            .into_iter()
+            .chain(json.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect::<Vec<_>>();
+
+        assert_eq!(parse_settings(json.as_bytes()), Some(custom.clone()));
+        assert_eq!(parse_settings(&utf8_bom), Some(custom.clone()));
+        assert_eq!(parse_settings(&utf16_le), Some(custom.clone()));
+        assert_eq!(parse_settings(&utf16_be), Some(custom));
+    }
+
+    #[test]
+    fn settings_parse_rejects_broken_files() {
+        assert_eq!(parse_settings(b"{ \"forwardTapHoldMs\": "), None);
+        assert_eq!(parse_settings(&[0xFF, 0xFE, b'{']), None);
+        assert_eq!(parse_settings(&[0xC3, 0x28]), None);
+    }
+
+    #[test]
+    fn settings_parse_fills_missing_fields_with_defaults() {
+        let parsed = parse_settings(br#"{ "forwardTapHoldMs": 9 }"#).unwrap();
+        assert_eq!(parsed.forward_tap_hold_ms, 9);
+        assert_eq!(
+            parsed.forward_tap_burst_count,
+            Settings::default().forward_tap_burst_count
+        );
     }
 
     #[test]

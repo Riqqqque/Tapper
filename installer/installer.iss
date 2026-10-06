@@ -45,8 +45,9 @@ Name: "startupicon"; Description: "Run Tapper when I sign in"; GroupDescription:
 
 [Files]
 Source: "{#PublishDir}\Tapper.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PublishDir}\tapper.settings.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PublishDir}\tapper.settings.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
 Source: "{#PublishDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PublishDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PublishDir}\assets\logo.png"; DestDir: "{app}\assets"; Flags: ignoreversion
 
 [Icons]
@@ -57,6 +58,11 @@ Name: "{userstartup}\Tapper"; Filename: "{app}\Tapper.exe"; IconFilename: "{app}
 
 [Run]
 Filename: "{app}\Tapper.exe"; Description: "Launch Tapper"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: files; Name: "{app}\tapper.settings.json"
+Type: files; Name: "{app}\tapper.settings.invalid.json"
+Type: files; Name: "{app}\Tapper.log"
 
 [Code]
 
@@ -97,7 +103,7 @@ var
   UpperName: String;
 begin
   UpperName := Uppercase(Name);
-  Result := Copy(UpperName, 1, 5) = 'UNINS';
+  Result := (Copy(UpperName, 1, 5) = 'UNINS') or (UpperName = 'TAPPER.SETTINGS.JSON');
 end;
 
 procedure ClearExistingTapperAppFiles;
@@ -150,5 +156,13 @@ begin
   begin
     StopRunningTapper;
     ClearExistingTapperAppFiles;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    StopRunningTapper;
   end;
 end;
