@@ -75,16 +75,12 @@ Left- or right-click the tray icon to see:
 ## How it works
 
 ```mermaid
-flowchart LR
-    wheel([Wheel notch]) --> game[Apex gets the wheel input as usual]
-    wheel --> on{Assist on?}
-    on -- yes --> strafe{A or D held?}
-    strafe -- yes --> focus{Apex in the foreground?}
-    focus -- yes --> burst[Queue a burst of W taps]
-    burst --> send[Send W down, wait, W up]
-    on -- no --> skip([Do nothing])
-    strafe -- no --> skip
-    focus -- no --> skip
+flowchart TD
+    wheel([You scroll one notch]) --> game[Apex gets the wheel input as usual]
+    wheel --> check{"Assist on, A or D held,<br>and Apex in the foreground?"}
+    check -- no --> skip([No extra input])
+    check -- yes --> burst[Queue a burst of W taps]
+    burst --> send[Each tap: W down, short hold, W up]
 ```
 
 - **Wheel:** Tapper listens to the mouse through Windows Raw Input. It only reads wheel events and never blocks or changes them.
